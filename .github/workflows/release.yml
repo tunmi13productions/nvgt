@@ -462,3 +462,33 @@ jobs:
         checksumGenerateAssets: "false"
         assets: |
           - path: '*_package/nvgt_${{env.nvgt_version}}.*'
+
+  # Fork-only release publishing.
+  #
+  # publish_latest and publish_release above are both gated on
+  # `github.event.repository.fork == false`, so on a fork every platform builds and packages
+  # successfully and then nothing is ever published -- the results exist only as workflow
+  # artifacts, which expire and can't be fetched with `gh release download`.
+  #
+  # This job fills that gap for forks that carry local patches and need consumers to install
+  # them the same way they'd install an upstream release. It deliberately does NOT touch the
+  # upstream jobs, so rebasing onto upstream stays a clean fast-forward, and it skips the
+  # nvgt.dev FTP uploads in publish_release, which depend on secrets a fork doesn't have.
+  publish_release_fork:
+    runs-on: ubuntu-latest
+    needs: ["windows_package", "mac_package", "linux_package"]
+    if: github.ref_type == 'tag' && github.event.repository.fork == true
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: '*_package'
+    - name: set_version
+      run: python3 build/ci_set_version.py
+    - uses: ghalactic/github-release-from-tag@v5
+      with:
+        checksumGenerateAssets: "false"
+        assets: |
+          - path: '*_package/nvgt_${{env.nvgt_version}}.*'

@@ -1581,8 +1581,23 @@ public:
 		g_sound_service->cleanup_triplet(triplet);
 		return g_soundsystem_last_error == MA_SUCCESS;
 	}
+	// NOTE: deliberately NOT MA_SOUND_FLAG_ASYNC. With async decoding, load() returns before the
+	// resource manager has filled the first pages, and get_active() reports true as soon as the
+	// ma_sound object exists rather than when audio is actually available (postload only marks the
+	// load complete eagerly for non-async paths). A caller that loads and immediately plays --
+	// which is what a sound pool does for a one-shot -- therefore starts playback partway into the
+	// buffer: the first few milliseconds are missing, and entering mid-waveform at a non-zero
+	// sample is an audible click.
+	//
+	// Decoding inline costs a few milliseconds on the first play of a file that isn't already
+	// resident, and nothing afterwards, since the resource manager caches the decode against the
+	// filename. Retention is unchanged: same triplet, same resource-manager entry, same reference
+	// counting against live ma_sound objects.
+	//
+	// load_pcm/load_string_async keep MA_SOUND_FLAG_ASYNC -- their async behaviour is what makes
+	// TTS responsive, and they aren't used in a load-then-play-immediately pattern.
 	bool load(const string &filename, const pack_interface* pack_file) override {
-		return load_special(filename, pack_file && pack_file->get_is_active()? g_pack_protocol_slot : sound_service::fs_protocol_slot, pack_file && pack_file->get_is_active()? std::shared_ptr < const pack_interface > (pack_file->make_immutable()) : nullptr, 0, nullptr, MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC);
+		return load_special(filename, pack_file && pack_file->get_is_active()? g_pack_protocol_slot : sound_service::fs_protocol_slot, pack_file && pack_file->get_is_active()? std::shared_ptr < const pack_interface > (pack_file->make_immutable()) : nullptr, 0, nullptr, MA_SOUND_FLAG_DECODE);
 	}
 	bool stream(const std::string &filename, const pack_interface* pack_file) override {
 		return load_special(filename, pack_file && pack_file->get_is_active()? g_pack_protocol_slot : sound_service::fs_protocol_slot, pack_file && pack_file->get_is_active()? std::shared_ptr < const pack_interface > (pack_file->make_immutable()) : nullptr, 0, nullptr, MA_SOUND_FLAG_STREAM);
@@ -1677,6 +1692,12 @@ public:
 		ma_format format = pcm_stream? ma_format_unknown : ma_format_from_angelscript_type(buffer->subtypeid);
 		int nchannels = pcm_stream? ma_pcm_rb_get_channels(&*pcm_stream) : channels? channels : get_engine()->get_channels();
 		return stream_pcm(buffer->ptr, buffer->size / nchannels, format, sample_rate, channels, buffer_size);
+	}
+	unsigned int get_pcm_available_read() const override {
+		return pcm_stream ? ma_pcm_rb_available_read(&*pcm_stream) : 0;
+	}
+	unsigned int get_pcm_available_write() const override {
+		return pcm_stream ? ma_pcm_rb_available_write(&*pcm_stream) : 0;
 	}
 	bool open(audio_data_source* ds) override {
 		if (!ds || !ds->get_active()) return false;
@@ -2607,6 +2628,8 @@ void RegisterSoundsystem(asIScriptEngine *engine) {
 	engine->RegisterObjectMethod("sound", "bool stream_pcm(const memory_buffer<int>&in data, uint sample_rate = 0, uint channels = 0, uint buffer_size = 0)", asFUNCTION((virtual_call < sound, &sound::stream_pcm_script_memory_buffer, bool, script_memory_buffer*, unsigned int, unsigned int, unsigned int>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("sound", "bool stream_pcm(const memory_buffer<int16>&in data, uint sample_rate = 0, uint channels = 0, uint buffer_size = 0)", asFUNCTION((virtual_call < sound, &sound::stream_pcm_script_memory_buffer, bool, script_memory_buffer*, unsigned int, unsigned int, unsigned int>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("sound", "bool stream_pcm(const memory_buffer<uint8>&in data, uint sample_rate = 0, uint channels = 0, uint buffer_size = 0)", asFUNCTION((virtual_call < sound, &sound::stream_pcm_script_memory_buffer, bool, script_memory_buffer*, unsigned int, unsigned int, unsigned int>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("sound", "uint get_pcm_available_read() const property", asFUNCTION((virtual_call<sound, &sound::get_pcm_available_read, unsigned int>)), asCALL_CDECL_OBJFIRST);
+	engine->RegisterObjectMethod("sound", "uint get_pcm_available_write() const property", asFUNCTION((virtual_call<sound, &sound::get_pcm_available_write, unsigned int>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("sound", "bool open(audio_data_source@ datasource)", asFUNCTION((virtual_call<sound, &sound::open, bool, audio_data_source*>)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("sound", "bool close()", asFUNCTION((virtual_call < sound, &sound::close, bool >)), asCALL_CDECL_OBJFIRST);
 	engine->RegisterObjectMethod("sound", "void set_autoclose(bool enabled = true) property", asFUNCTION((virtual_call < sound, &sound::set_autoclose, void, bool >)), asCALL_CDECL_OBJFIRST);
