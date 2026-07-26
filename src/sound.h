@@ -373,6 +373,12 @@ public:
 	virtual bool stream_pcm(const void* data, unsigned int size_in_frames, ma_format format = ma_format_unknown, unsigned int sample_rate = 0, unsigned int channels = 0, unsigned int buffer_size = 0) = 0;
 	virtual bool stream_pcm_script_array(CScriptArray *buffer, unsigned int samplerate, unsigned int channels, unsigned int buffer_size = 0) = 0;
 	virtual bool stream_pcm_script_memory_buffer(script_memory_buffer*buffer, unsigned int samplerate, unsigned int channels, unsigned int buffer_size = 0) = 0;
+	// Fill level of the PCM streaming ring buffer, in sample frames. Both return 0 when the
+	// sound is not in PCM streaming mode, so they are safe to call unconditionally. Without
+	// these there is no backpressure signal for a real-time producer (e.g. a voice-chat
+	// jitter buffer) -- you are pushing audio blind.
+	virtual unsigned int get_pcm_available_read() const = 0;
+	virtual unsigned int get_pcm_available_write() const = 0;
 	virtual bool open(audio_data_source* datasource) = 0;
 	virtual bool close() = 0;
 	virtual void set_autoclose(bool enabled = true) = 0;
