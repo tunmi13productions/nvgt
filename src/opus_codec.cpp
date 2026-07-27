@@ -67,7 +67,10 @@ public:
 		if (frame_size <= 0) return "";
 		vector<opus_int16> in(samples);
 		memcpy(in.data(), pcm.data(), samples * sizeof(opus_int16));
-		vector<unsigned char> out(size_t(OPUS_CODEC_MAX_PACKET));
+		// static_cast, not size_t(...): `vector<unsigned char> out(size_t(NAME));` is a most vexing
+		// parse -- the compiler reads it as declaring a function taking a size_t, and every use of
+		// `out` below then fails on a function type.
+		vector<unsigned char> out(static_cast<size_t>(OPUS_CODEC_MAX_PACKET));
 		const opus_int32 n = opus_encode(enc, in.data(), frame_size, out.data(), OPUS_CODEC_MAX_PACKET);
 		if (n < 0) return "";
 		return string(reinterpret_cast<const char*>(out.data()), size_t(n));
