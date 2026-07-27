@@ -28,6 +28,7 @@
 #include "nvgt_angelscript.h" // get_array_type
 #include "nvgt_plugin.h"      // pack_interface
 #include "sound.h"
+#include "opus_codec.h" // fork addition: raw opus packet codec, see that file
 #include <opus/opus.h>
 #include <opus/opusenc.h>
 #include "sound_nodes.h"
@@ -2606,6 +2607,9 @@ void RegisterSoundsystem(asIScriptEngine *engine) {
 	RegisterSoundsystemDataSources(engine);
 	RegisterSoundsystemNodes(engine);
 	RegisterSoundsystemEncoders(engine);
+	// Fork addition. After the encoders so it follows the opus_application_type and
+	// opus_signal_type enums registered there, which its constructors take values from.
+	RegisterOpusCodec(engine);
 	RegisterSoundsystemShapes(engine);
 	engine->RegisterObjectBehaviour("sound", asBEHAVE_FACTORY, "sound@ s()", asFUNCTION(new_global_sound), asCALL_CDECL);
 	engine->RegisterObjectMethod("sound", "bool load(const string&in filename, const pack_interface@ pack = sound_default_pack)", asFUNCTION((virtual_call < sound, &sound::load, bool, const string &, pack_interface * >)), asCALL_CDECL_OBJFIRST);
