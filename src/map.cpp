@@ -245,8 +245,29 @@ int map_frame::add_areas_for_range(std::vector<map_area*>& local_areas, float mi
 	return p;
 }
 void map_frame::reset() {
-	for (auto i : areas)
+	for (auto i : areas) {
+		// Take this frame out of the area's own list before letting go of it. An area can outlive the
+		// frame that held it -- the release below only drops the reference this frame owned, and a
+		// script handle keeps the area alive past that -- while coordinate_map::reset() deletes every
+		// frame immediately after calling this. A survivor was therefore left with framed still set and
+		// freed map_frame pointers still sitting in frames[], and its next unframe() walked that list
+		// and read the areas vector out of a deleted frame.
+		//
+		// That read is a use-after-free that hides well: on Windows the freed block usually still looks
+		// intact and stays mapped, so the search over it quietly finds nothing and everything appears
+		// fine. Under a less forgiving allocator the same call faults on a pointer made of freed heap.
+		//
+		// Done before release() rather than after, because release() may be the one that deletes the
+		// area, and framed is cleared only once nothing is left holding it so that an area still framed
+		// elsewhere keeps saying so.
+		auto it = std::find(i->frames.begin(), i->frames.end(), this);
+		while (it != i->frames.end()) {
+			i->frames.erase(it);
+			it = std::find(i->frames.begin(), i->frames.end(), this);
+		}
+		if (i->frames.empty()) i->framed = false;
 		i->release();
+	}
 	areas.clear();
 }
 
