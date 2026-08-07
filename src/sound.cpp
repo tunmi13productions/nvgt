@@ -721,23 +721,80 @@ audio_ring_buffer* audio_ring_buffer::create(unsigned int channels, unsigned int
 class audio_decoder_impl : public audio_data_source_impl, public virtual audio_decoder {
 	unique_ptr<ma_decoder> decoder;
 	datastream* datastream_ref; // If the user opens a datastream, we must maintain a reference to it encase the user drops their handle.
+	// Rewind window, so that a datastream which cannot seek can still be decoded.
+	//
+	// ma_decoder_init works out a format by trying each backend in turn: read a header, rewind to the
+	// start, let the next one have a go. That is fine for a file and impossible for a socket, and the
+	// seek callback below used to paper over the difference by reporting success for a seekg that had
+	// silently failed. Every backend after the first therefore read from a mangled position, none of
+	// them could initialise, and an Icecast or Shoutcast stream could never be opened at all --
+	// whatever format it was in, and on every platform.
+	//
+	// Everything handed to the decoder is kept here until the window fills, so a rewind inside it is
+	// answered from memory and never reaches the stream. Detection only ever looks at the first few
+	// kilobytes, so the window only has to outlast that; past it playback is linear and seeking is not
+	// wanted anyway. Seekable streams are unaffected: a target outside the window is still passed
+	// through to the stream itself, which is what keeps file decoding behaving exactly as before.
+	struct stream_cursor {
+		static const size_t CAP = 256 * 1024;
+		datastream* ds = nullptr;
+		std::string window;      // every byte served so far, until CAP
+		size_t pos = 0;          // logical read position, which is where the decoder believes it is
+		bool window_closed = false;
+	};
+	unique_ptr<stream_cursor> cursor;
 	static ma_result on_read_datastream(ma_decoder *pDecoder, void *pDst, size_t sizeInBytes, size_t *pBytesRead) {
 		if (pBytesRead) *pBytesRead = 0;
-		datastream* ds = static_cast<datastream*>(pDecoder->pUserData);
-		if (!ds) return MA_ERROR;
-		istream* stream = ds->get_istr();
+		stream_cursor* sc = static_cast<stream_cursor*>(pDecoder->pUserData);
+		if (!sc || !sc->ds) return MA_ERROR;
+		istream* stream = sc->ds->get_istr();
 		if (!stream) return MA_ERROR;
-		if (!stream->good()) return MA_AT_END;
-		stream->read((char *)pDst, sizeInBytes);
-		if (pBytesRead) *pBytesRead = stream->gcount();
-		return MA_SUCCESS;
+		char* out = static_cast<char*>(pDst);
+		size_t total = 0;
+		// Anything still inside the window is replayed from memory rather than pulled again.
+		if (sc->pos < sc->window.size()) {
+			size_t n = std::min(sc->window.size() - sc->pos, sizeInBytes);
+			memcpy(out, sc->window.data() + sc->pos, n);
+			sc->pos += n;
+			out += n;
+			total += n;
+			sizeInBytes -= n;
+		}
+		if (sizeInBytes > 0) {
+			if (!stream->good()) {
+				if (pBytesRead) *pBytesRead = total;
+				return total ? MA_SUCCESS : MA_AT_END;
+			}
+			stream->read(out, sizeInBytes);
+			size_t got = static_cast<size_t>(stream->gcount());
+			// While the window is open it holds every byte read so far, which is what keeps its end
+			// and the stream's real position the same place -- replaying up to it then continues
+			// seamlessly into fresh bytes instead of jumping.
+			if (!sc->window_closed && got) {
+				size_t room = stream_cursor::CAP - sc->window.size();
+				sc->window.append(out, std::min(room, got));
+				if (sc->window.size() >= stream_cursor::CAP) sc->window_closed = true;
+			}
+			sc->pos += got;
+			total += got;
+		}
+		if (pBytesRead) *pBytesRead = total;
+		return total ? MA_SUCCESS : MA_AT_END;
 	}
 	static ma_result on_seek_datastream(ma_decoder *pDecoder, ma_int64 offset, ma_seek_origin origin) {
-		datastream* ds = static_cast<datastream*>(pDecoder->pUserData);
-		if (!ds) return MA_ERROR;
-		istream* stream = ds->get_istr();
+		stream_cursor* sc = static_cast<stream_cursor*>(pDecoder->pUserData);
+		if (!sc || !sc->ds) return MA_ERROR;
+		istream* stream = sc->ds->get_istr();
 		if (!stream) return MA_ERROR;
-		stream->clear();
+		// Where this wants to land, when that can be worked out. A seek from the end means nothing on
+		// a stream of unknown length, so it is left for the stream itself to accept or refuse.
+		ma_int64 target = -1;
+		if (origin == ma_seek_origin_start) target = offset;
+		else if (origin == ma_seek_origin_current) target = static_cast<ma_int64>(sc->pos) + offset;
+		if (target >= 0 && static_cast<size_t>(target) <= sc->window.size()) {
+			sc->pos = static_cast<size_t>(target); // inside the window, so no real seek is needed
+			return MA_SUCCESS;
+		}
 		std::ios_base::seekdir dir;
 		switch (origin) {
 			case ma_seek_origin_start:
@@ -752,15 +809,26 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 			default: // Should never get here.
 				return MA_ERROR;
 		}
+		stream->clear();
 		stream->seekg(offset, dir);
+		if (stream->fail()) {
+			// Genuinely unseekable, and outside what was kept. Say so rather than claiming a seek that
+			// did not happen -- that claim is exactly what made live streams undecodable.
+			stream->clear();
+			return MA_NOT_IMPLEMENTED;
+		}
+		// The stream really moved, so the window no longer describes where the decoder is.
+		sc->pos = static_cast<size_t>(stream->tellg());
+		sc->window.clear();
+		sc->window_closed = true;
 		return MA_SUCCESS;
 	}
 	static ma_result on_tell_datastream(ma_decoder *pDecoder, ma_int64 *pCursor) {
-		datastream* ds = static_cast<datastream*>(pDecoder->pUserData);
-		if (!ds) return MA_ERROR;
-		istream* stream = ds->get_istr();
-		if (!stream) return MA_ERROR;
-		*pCursor = stream->tellg();
+		// The logical position, not the stream's: while the window is being replayed the two differ,
+		// and the decoder's own view is the one that has to be answered.
+		stream_cursor* sc = static_cast<stream_cursor*>(pDecoder->pUserData);
+		if (!sc || !sc->ds) return MA_ERROR;
+		*pCursor = static_cast<ma_int64>(sc->pos);
 		return MA_SUCCESS;
 	}
 	ma_decoder_config decoder_config_init(unsigned int sample_rate, unsigned int channels) {
@@ -793,9 +861,12 @@ public:
 			return false;
 		}
 		ma_decoder_config cfg = decoder_config_init(sample_rate, channels);
+		cursor = make_unique<stream_cursor>();
+		cursor->ds = ds;
 		// Note: We used to pass on_tell_datastream here until miniaudio update Jan 8 2026, if something breaks with raw decoders and end checking, look here.
-		if ((g_soundsystem_last_error = ma_decoder_init(on_read_datastream, on_seek_datastream, ds, &cfg, &*decoder)) != MA_SUCCESS) {
+		if ((g_soundsystem_last_error = ma_decoder_init(on_read_datastream, on_seek_datastream, &*cursor, &cfg, &*decoder)) != MA_SUCCESS) {
 			decoder.reset();
+			cursor.reset();
 			ds->release();
 		} else {
 			datastream_ref = ds;
@@ -812,6 +883,7 @@ public:
 		}
 		if ((g_soundsystem_last_error = ma_decoder_uninit(&*decoder)) != MA_SUCCESS ) return false;
 		decoder.reset();
+		cursor.reset(); // after uninit, since the callbacks read through this
 		return true;
 	}
 	virtual unsigned int get_sample_rate() const override { return decoder? decoder->outputSampleRate : 0; }
