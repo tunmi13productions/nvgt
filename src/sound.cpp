@@ -740,7 +740,11 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 		datastream* ds = nullptr;
 		std::string window;      // every byte served so far, until CAP
 		size_t pos = 0;          // logical read position, which is where the decoder believes it is
-		bool window_closed = false;
+		// The window may only answer a seek while it MIRRORS the stream: holding bytes [0, size) and
+		// nothing having moved the stream out from under it. Both of these have to stop that.
+		bool window_full = false;   // hit CAP, so it no longer holds everything read
+		bool window_moved = false;  // a real seek happened, so it no longer starts at byte 0
+		bool mirrors_stream() const { return !window_full && !window_moved; }
 	};
 	unique_ptr<stream_cursor> cursor;
 	static ma_result on_read_datastream(ma_decoder *pDecoder, void *pDst, size_t sizeInBytes, size_t *pBytesRead) {
@@ -752,7 +756,7 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 		char* out = static_cast<char*>(pDst);
 		size_t total = 0;
 		// Anything still inside the window is replayed from memory rather than pulled again.
-		if (sc->pos < sc->window.size()) {
+		if (sc->mirrors_stream() && sc->pos < sc->window.size()) {
 			size_t n = std::min(sc->window.size() - sc->pos, sizeInBytes);
 			memcpy(out, sc->window.data() + sc->pos, n);
 			sc->pos += n;
@@ -770,10 +774,10 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 			// While the window is open it holds every byte read so far, which is what keeps its end
 			// and the stream's real position the same place -- replaying up to it then continues
 			// seamlessly into fresh bytes instead of jumping.
-			if (!sc->window_closed && got) {
+			if (sc->mirrors_stream() && got) {
 				size_t room = stream_cursor::CAP - sc->window.size();
 				sc->window.append(out, std::min(room, got));
-				if (sc->window.size() >= stream_cursor::CAP) sc->window_closed = true;
+				if (sc->window.size() >= stream_cursor::CAP) sc->window_full = true;
 			}
 			sc->pos += got;
 			total += got;
@@ -791,7 +795,13 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 		ma_int64 target = -1;
 		if (origin == ma_seek_origin_start) target = offset;
 		else if (origin == ma_seek_origin_current) target = static_cast<ma_int64>(sc->pos) + offset;
-		if (target >= 0 && static_cast<size_t>(target) <= sc->window.size()) {
+		// Only while the window mirrors the stream. Testing target <= window.size() on its own is not
+		// enough and was wrong in a way that mattered: after a real seek the window is emptied, and
+		// then a rewind to 0 satisfies 0 <= 0 and reports success without moving the stream, which
+		// leaves the decoder reading from wherever that earlier seek had parked it. A seekable stream
+		// gets a seek to the end to measure its length before anything else, so that is not a corner
+		// case -- it is every in-memory datastream, and it broke all of them.
+		if (sc->mirrors_stream() && target >= 0 && static_cast<size_t>(target) <= sc->window.size()) {
 			sc->pos = static_cast<size_t>(target); // inside the window, so no real seek is needed
 			return MA_SUCCESS;
 		}
@@ -817,10 +827,11 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 			stream->clear();
 			return MA_NOT_IMPLEMENTED;
 		}
-		// The stream really moved, so the window no longer describes where the decoder is.
+		// The stream really moved, so the window no longer describes where the decoder is. From here
+		// the stream answers for itself, which is what it could always do -- it seeks.
 		sc->pos = static_cast<size_t>(stream->tellg());
 		sc->window.clear();
-		sc->window_closed = true;
+		sc->window_moved = true;
 		return MA_SUCCESS;
 	}
 	static ma_result on_tell_datastream(ma_decoder *pDecoder, ma_int64 *pCursor) {
