@@ -80,14 +80,25 @@ public:
 };
 
 // Prebuffered input stream for unseekable sources like internet radio
+//
+// The rewind window has to outlast format detection. ma_decoder_init identifies a stream by trying
+// each backend in turn -- read a header, rewind to the start, let the next one have a go -- and a
+// socket cannot rewind, so the window is what stands in for that. It used to be thrown away for
+// good the moment it was drained, which happened after about two probes, and every rewind after
+// that failed: no live stream could ever be opened through stream_url, in any format, anywhere.
+//
+// So the window now holds everything handed out, up to WINDOW_CAP, and only stops once the source
+// has genuinely outrun it. Past that a rewind is refused rather than silently mishandled, which is
+// correct: by then playback is linear and nothing asks to seek.
 class prebuffer_istreambuf : public Poco::BasicBufferedStreamBuf<char, std::char_traits<char>> {
+	static const std::size_t WINDOW_CAP = 256 * 1024;
 	std::istream* source;
-	std::vector<char> prebuffer;
-	std::size_t prebuffer_size;
-	std::size_t prebuffer_pos;
-	bool prebuffer_discarded;
+	std::vector<char> window;   // every byte handed out so far, until WINDOW_CAP
+	std::size_t initial_fill;   // pulled up front, both to prime the connection and to seed the window
+	std::size_t window_pos;     // logical read position, which is where the reader believes it is
+	bool window_closed;         // outgrew WINDOW_CAP, so rewinding is no longer possible
 	bool owns_source;
-	bool fill_prebuffer();
+	bool fill_window();
 public:
 	prebuffer_istreambuf(std::istream& source, std::size_t prebuffer_size = 1024);
 	~prebuffer_istreambuf();
