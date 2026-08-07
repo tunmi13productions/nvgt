@@ -202,15 +202,24 @@ int prebuffer_istreambuf::readFromDevice(char* buffer, std::streamsize length) {
 	return static_cast<int>(bytes_read);
 }
 std::streampos prebuffer_istreambuf::seekoff(std::streamoff off, std::ios_base::seekdir dir, std::ios_base::openmode which) {
-	if (dir == std::ios_base::beg && off == 0) return seekpos(0);
-	return -1;
+	// Where the reader actually is. The base class reads ahead of it, and those bytes were counted
+	// into window_pos when readFromDevice handed them over, so they have to come back off.
+	std::streamoff consumed = static_cast<std::streamoff>(window_pos) - (egptr() - gptr());
+	// tellg() arrives here as a seek of zero from the current position. That is a question, not a
+	// move, and this used to answer -1 to it -- so ma_vfs's onTell reported MA_NOT_IMPLEMENTED and
+	// the resource manager abandoned the sound before it ever probed the format.
+	if (dir == std::ios_base::cur && off == 0) return consumed;
+	if (dir == std::ios_base::end) return -1; // the length is unknown, so this genuinely cannot be answered
+	return seekpos(dir == std::ios_base::beg ? off : consumed + off, which);
 }
 std::streampos prebuffer_istreambuf::seekpos(std::streampos pos, std::ios_base::openmode which) {
-	if (pos != 0 || window_closed) return -1;
+	std::streamoff target = pos;
+	if (target < 0 || window_closed) return -1;
 	if (window.empty()) fill_window();
-	window_pos = 0;
+	if (static_cast<std::size_t>(target) > window.size()) return -1; // past what was kept, and the source cannot go back
+	window_pos = static_cast<std::size_t>(target);
 	setg(nullptr, nullptr, nullptr); // drop what the base class had buffered, so it reads through us again
-	return 0;
+	return pos;
 }
 prebuffer_istream::prebuffer_istream(std::istream& source, std::size_t prebuffer_size) : basic_istream(new prebuffer_istreambuf(source, prebuffer_size)) {}
 prebuffer_istream::~prebuffer_istream() { delete rdbuf(); }
