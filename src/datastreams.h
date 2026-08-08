@@ -19,6 +19,10 @@
 #include <Poco/BinaryWriter.h>
 #include <Poco/RefCountedObject.h>
 #include <Poco/SharedPtr.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <Poco/BufferedStreamBuf.h>
 #include <Poco/BufferedBidirectionalStreamBuf.h>
 #include <SDL3/SDL_iostream.h>
@@ -79,37 +83,58 @@ public:
 	sdl_file_stream(SDL_IOStream* io, std::ios::openmode mode); // wrap an externally-owned process stdio stream
 };
 
+// How deep a netstream reads ahead of what is being played, in bytes, and how much is in there right
+// now. Settable from script, because the useful depth depends on the server rather than on us: an
+// Icecast stream is paced at real time, so the ring holds roughly whatever that server is willing to
+// send ahead of real time and no setting can conjure more. Read netstream_buffered before turning
+// netstream_buffer_size up -- if the ring is not filling, the ceiling is not what is limiting it.
+extern std::size_t g_netstream_buffer_size;
+extern std::atomic<std::size_t> g_netstream_buffered; // most recently active netstream; a gauge, not a guarantee
+
 // Prebuffered input stream for unseekable sources like internet radio
 //
-// The rewind window has to outlast format detection. ma_decoder_init identifies a stream by trying
-// each backend in turn -- read a header, rewind to the start, let the next one have a go -- and a
-// socket cannot rewind, so the window is what stands in for that. It used to be thrown away for
-// good the moment it was drained, which happened after about two probes, and every rewind after
-// that failed: no live stream could ever be opened through stream_url, in any format, anywhere.
+// Two separate jobs here, and confusing them is what made this class wrong twice.
 //
-// So the window now holds everything handed out, up to WINDOW_CAP, and only stops once the source
-// has genuinely outrun it. Past that a rewind is refused rather than silently mishandled, which is
-// correct: by then playback is linear and nothing asks to seek.
+// The DETECTION WINDOW holds the front of the stream so ma_decoder_init can rewind over it. Init
+// identifies a stream by trying each backend in turn -- read a header, rewind, let the next one have
+// a go -- and a socket cannot rewind. The window used to be discarded the moment it was drained,
+// after about two probes, so every rewind after that failed.
+//
+// The READ-AHEAD RING is what keeps playback smooth. Decoding happens on the resource manager's job
+// thread, which keeps two one-second pages, so without a ring the entire cushion is two seconds and
+// any slower moment on the network is an audible gap. A reader thread pulls from the source as fast
+// as it will come, so a consumer waits on the network only once the ring has actually run dry.
 class prebuffer_istreambuf : public Poco::BasicBufferedStreamBuf<char, std::char_traits<char>> {
-	static const std::size_t WINDOW_CAP = 256 * 1024;
+	static const std::size_t READ_CHUNK = 4096; // also the longest the destructor can wait on a blocked read
 	std::istream* source;
-	std::vector<char> window;   // every byte handed out so far, until WINDOW_CAP
-	std::size_t initial_fill;   // pulled up front, both to prime the connection and to seed the window
-	std::size_t window_pos;     // logical read position, which is where the reader believes it is
-	bool window_closed;         // outgrew WINDOW_CAP, so rewinding is no longer possible
+	// Detection window. Holds every byte handed to the consumer until it reaches detect_window, which
+	// is what keeps its contents and the consumer's position describing the same stretch of stream.
+	std::vector<char> window;
+	std::size_t detect_window;
+	std::size_t window_pos;
+	bool window_closed;
+	// Read-ahead ring, written by reader_loop and drained by readFromDevice.
+	std::vector<char> ring;
+	std::size_t ring_head, ring_tail, ring_count;
+	mutable std::mutex mtx;
+	std::condition_variable filled, drained;
+	std::thread reader;
+	bool stopping, source_done;
 	bool owns_source;
-	bool fill_window();
+	void reader_loop();
+	std::size_t take(char* out, std::size_t n); // out of the ring, waiting only if it is empty
 public:
 	prebuffer_istreambuf(std::istream& source, std::size_t prebuffer_size = 1024);
 	~prebuffer_istreambuf();
 	void own_source(bool owns);
+	std::size_t buffered() const;
 	virtual int readFromDevice(char* buffer, std::streamsize length);
 	virtual std::streampos seekoff(std::streamoff off, std::ios_base::seekdir dir, std::ios_base::openmode which = std::ios_base::in);
 	virtual std::streampos seekpos(std::streampos pos, std::ios_base::openmode which = std::ios_base::in);
 };
 class prebuffer_istream : public std::istream {
 public:
-	prebuffer_istream(std::istream& source, std::size_t prebuffer_size = 16384);
+	prebuffer_istream(std::istream& source, std::size_t prebuffer_size = 128 * 1024);
 	~prebuffer_istream();
 	std::istream& own_source(bool owns = true);
 };

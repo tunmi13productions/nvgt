@@ -2549,6 +2549,14 @@ void RegisterSoundsystemShapes(asIScriptEngine* engine) {
 	engine->RegisterObjectProperty("sound_aabb_shape", "int lower_range", asOFFSET(sound_aabb_shape, lower_range));
 	engine->RegisterObjectProperty("sound_aabb_shape", "int upper_range", asOFFSET(sound_aabb_shape, upper_range));
 }
+// How far a netstream reads ahead of what is being played. Exposed because the depth that helps
+// depends on the server, not on us: a live stream is paced at real time, so no setting can buy more
+// headroom than that server is willing to send early. sound_netstream_buffered is the one to watch --
+// if it sits near zero, raising the size will not change anything.
+static void set_netstream_buffer_size(unsigned int bytes) { g_netstream_buffer_size = bytes; }
+static unsigned int get_netstream_buffer_size() { return static_cast<unsigned int>(g_netstream_buffer_size); }
+static unsigned int get_netstream_buffered() { return static_cast<unsigned int>(g_netstream_buffered.load()); }
+
 void RegisterSoundsystem(asIScriptEngine *engine) {
 	engine->RegisterEnum("audio_error_state");
 	engine->RegisterEnumValue("audio_error_state", "AUDIO_ERROR_STATE_SUCCESS", MA_SUCCESS);
@@ -2738,6 +2746,9 @@ void RegisterSoundsystem(asIScriptEngine *engine) {
 	engine->RegisterGlobalFunction("pack_interface@ get_sound_default_pack() property", asFUNCTION(get_sound_default_storage), asCALL_CDECL);
 	engine->RegisterGlobalFunction("void set_sound_master_volume(float db) property", asFUNCTION(set_sound_master_volume), asCALL_CDECL);
 	engine->RegisterGlobalFunction("float get_sound_master_volume() property", asFUNCTION(get_sound_master_volume), asCALL_CDECL);
+	engine->RegisterGlobalFunction("void set_sound_netstream_buffer_size(uint bytes) property", asFUNCTION(set_netstream_buffer_size), asCALL_CDECL);
+	engine->RegisterGlobalFunction("uint get_sound_netstream_buffer_size() property", asFUNCTION(get_netstream_buffer_size), asCALL_CDECL);
+	engine->RegisterGlobalFunction("uint get_sound_netstream_buffered() property", asFUNCTION(get_netstream_buffered), asCALL_CDECL);
 	engine->RegisterGlobalFunction("audio_error_state get_SOUNDSYSTEM_LAST_ERROR() property", asFUNCTION(get_soundsystem_last_error), asCALL_CDECL);
 	engine->RegisterGlobalFunction("string get_SOUNDSYSTEM_LAST_ERROR_TEXT() property", asFUNCTION(get_soundsystem_last_error_text), asCALL_CDECL);
 	engine->RegisterGlobalFunction("void set_sound_default_3d_panner(int panner_id)", asFUNCTION(sound_set_default_3d_panner), asCALL_CDECL);
