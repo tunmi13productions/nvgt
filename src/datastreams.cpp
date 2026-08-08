@@ -185,12 +185,10 @@ int prebuffer_istreambuf::readFromDevice(char* buffer, std::streamsize length) {
 		source->read(buffer, length);
 		std::streamsize got = source->gcount();
 		if (!window_closed && got > 0) {
-			// While it is open the window holds every byte read so far, which is what keeps its end
-			// and the source's real position the same place -- replaying up to it then continues
-			// seamlessly into fresh bytes instead of jumping. Once that can no longer hold, the
-			// window is of no further use and says so.
-			if (static_cast<std::size_t>(got) <= WINDOW_CAP - window.size()) window.insert(window.end(), buffer, buffer + got);
-			else {
+			// Keeps every byte read so far so the window's end tracks the source's real position; once it hits WINDOW_CAP it's of no further use, so it's freed immediately rather than held for no reason.
+			std::size_t room = WINDOW_CAP - window.size();
+			window.insert(window.end(), buffer, buffer + std::min(static_cast<std::size_t>(got), room));
+			if (window.size() >= WINDOW_CAP) {
 				window.clear();
 				window.shrink_to_fit();
 				window_closed = true;
@@ -202,13 +200,9 @@ int prebuffer_istreambuf::readFromDevice(char* buffer, std::streamsize length) {
 	return static_cast<int>(bytes_read);
 }
 std::streampos prebuffer_istreambuf::seekoff(std::streamoff off, std::ios_base::seekdir dir, std::ios_base::openmode which) {
-	// Where the reader actually is. The base class reads ahead of it, and those bytes were counted
-	// into window_pos when readFromDevice handed them over, so they have to come back off.
+	// Where the reader actually is: the base class reads ahead of it, so those bytes have to come back off window_pos.
 	std::streamoff consumed = static_cast<std::streamoff>(window_pos) - (egptr() - gptr());
-	// tellg() arrives here as a seek of zero from the current position. That is a question, not a
-	// move, and this used to answer -1 to it -- so ma_vfs's onTell reported MA_NOT_IMPLEMENTED and
-	// the resource manager abandoned the sound before it ever probed the format.
-	if (dir == std::ios_base::cur && off == 0) return consumed;
+	if (dir == std::ios_base::cur && off == 0) return consumed; // tellg() arrives here as this; answering it is what lets ma_vfs's onTell succeed
 	if (dir == std::ios_base::end) return -1; // the length is unknown, so this genuinely cannot be answered
 	return seekpos(dir == std::ios_base::beg ? off : consumed + off, which);
 }

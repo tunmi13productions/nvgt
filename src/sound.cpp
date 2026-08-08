@@ -720,27 +720,12 @@ audio_ring_buffer* audio_ring_buffer::create(unsigned int channels, unsigned int
 class audio_decoder_impl : public audio_data_source_impl, public virtual audio_decoder {
 	unique_ptr<ma_decoder> decoder;
 	datastream* datastream_ref; // If the user opens a datastream, we must maintain a reference to it encase the user drops their handle.
-	// Rewind window, so that a datastream which cannot seek can still be decoded.
-	//
-	// ma_decoder_init works out a format by trying each backend in turn: read a header, rewind to the
-	// start, let the next one have a go. That is fine for a file and impossible for a socket, and the
-	// seek callback below used to paper over the difference by reporting success for a seekg that had
-	// silently failed. Every backend after the first therefore read from a mangled position, none of
-	// them could initialise, and an Icecast or Shoutcast stream could never be opened at all --
-	// whatever format it was in, and on every platform.
-	//
-	// Everything handed to the decoder is kept here until the window fills, so a rewind inside it is
-	// answered from memory and never reaches the stream. Detection only ever looks at the first few
-	// kilobytes, so the window only has to outlast that; past it playback is linear and seeking is not
-	// wanted anyway. Seekable streams are unaffected: a target outside the window is still passed
-	// through to the stream itself, which is what keeps file decoding behaving exactly as before.
+	// Rewind window so a datastream that can't seek (a live socket) can still be probed and decoded; answers rewinds from memory instead of the stream until the window outgrows CAP or a real seek moves the stream.
 	struct stream_cursor {
 		static const size_t CAP = 256 * 1024;
 		datastream* ds = nullptr;
 		std::string window;      // every byte served so far, until CAP
 		size_t pos = 0;          // logical read position, which is where the decoder believes it is
-		// The window may only answer a seek while it MIRRORS the stream: holding bytes [0, size) and
-		// nothing having moved the stream out from under it. Both of these have to stop that.
 		bool window_full = false;   // hit CAP, so it no longer holds everything read
 		bool window_moved = false;  // a real seek happened, so it no longer starts at byte 0
 		bool mirrors_stream() const { return !window_full && !window_moved; }
@@ -770,13 +755,14 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 			}
 			stream->read(out, sizeInBytes);
 			size_t got = static_cast<size_t>(stream->gcount());
-			// While the window is open it holds every byte read so far, which is what keeps its end
-			// and the stream's real position the same place -- replaying up to it then continues
-			// seamlessly into fresh bytes instead of jumping.
+			// Keeps every byte read so far so the window's end tracks the stream's real position; once full it can never answer a seek again, so it's freed immediately rather than held for the rest of the decoder's life.
 			if (sc->mirrors_stream() && got) {
 				size_t room = stream_cursor::CAP - sc->window.size();
 				sc->window.append(out, std::min(room, got));
-				if (sc->window.size() >= stream_cursor::CAP) sc->window_full = true;
+				if (sc->window.size() >= stream_cursor::CAP) {
+					sc->window_full = true;
+					std::string().swap(sc->window);
+				}
 			}
 			sc->pos += got;
 			total += got;
@@ -789,17 +775,11 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 		if (!sc || !sc->ds) return MA_ERROR;
 		istream* stream = sc->ds->get_istr();
 		if (!stream) return MA_ERROR;
-		// Where this wants to land, when that can be worked out. A seek from the end means nothing on
-		// a stream of unknown length, so it is left for the stream itself to accept or refuse.
+		// Where this wants to land, when that can be worked out; a seek from the end is left for the stream to accept or refuse, since a live stream's length is unknown.
 		ma_int64 target = -1;
 		if (origin == ma_seek_origin_start) target = offset;
 		else if (origin == ma_seek_origin_current) target = static_cast<ma_int64>(sc->pos) + offset;
-		// Only while the window mirrors the stream. Testing target <= window.size() on its own is not
-		// enough and was wrong in a way that mattered: after a real seek the window is emptied, and
-		// then a rewind to 0 satisfies 0 <= 0 and reports success without moving the stream, which
-		// leaves the decoder reading from wherever that earlier seek had parked it. A seekable stream
-		// gets a seek to the end to measure its length before anything else, so that is not a corner
-		// case -- it is every in-memory datastream, and it broke all of them.
+		// Only answer from the window while it still mirrors the stream, otherwise a rewind to 0 after a real seek would wrongly report success without moving the stream.
 		if (sc->mirrors_stream() && target >= 0 && static_cast<size_t>(target) <= sc->window.size()) {
 			sc->pos = static_cast<size_t>(target); // inside the window, so no real seek is needed
 			return MA_SUCCESS;
@@ -821,21 +801,17 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 		stream->clear();
 		stream->seekg(offset, dir);
 		if (stream->fail()) {
-			// Genuinely unseekable, and outside what was kept. Say so rather than claiming a seek that
-			// did not happen -- that claim is exactly what made live streams undecodable.
-			stream->clear();
+			stream->clear(); // genuinely unseekable and outside what was kept; say so instead of claiming a seek that didn't happen
 			return MA_NOT_IMPLEMENTED;
 		}
-		// The stream really moved, so the window no longer describes where the decoder is. From here
-		// the stream answers for itself, which is what it could always do -- it seeks.
+		// The stream really moved, so the window no longer describes where the decoder is; from here the stream answers for itself. It can never mirror again, so free it rather than just clearing it.
 		sc->pos = static_cast<size_t>(stream->tellg());
-		sc->window.clear();
+		std::string().swap(sc->window);
 		sc->window_moved = true;
 		return MA_SUCCESS;
 	}
 	static ma_result on_tell_datastream(ma_decoder *pDecoder, ma_int64 *pCursor) {
-		// The logical position, not the stream's: while the window is being replayed the two differ,
-		// and the decoder's own view is the one that has to be answered.
+		// The logical position, not the stream's, since the two differ while the window is being replayed.
 		stream_cursor* sc = static_cast<stream_cursor*>(pDecoder->pUserData);
 		if (!sc || !sc->ds) return MA_ERROR;
 		*pCursor = static_cast<ma_int64>(sc->pos);

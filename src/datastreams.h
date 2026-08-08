@@ -79,17 +79,7 @@ public:
 	sdl_file_stream(SDL_IOStream* io, std::ios::openmode mode); // wrap an externally-owned process stdio stream
 };
 
-// Prebuffered input stream for unseekable sources like internet radio
-//
-// The rewind window has to outlast format detection. ma_decoder_init identifies a stream by trying
-// each backend in turn -- read a header, rewind to the start, let the next one have a go -- and a
-// socket cannot rewind, so the window is what stands in for that. It used to be thrown away for
-// good the moment it was drained, which happened after about two probes, and every rewind after
-// that failed: no live stream could ever be opened through stream_url, in any format, anywhere.
-//
-// So the window now holds everything handed out, up to WINDOW_CAP, and only stops once the source
-// has genuinely outrun it. Past that a rewind is refused rather than silently mishandled, which is
-// correct: by then playback is linear and nothing asks to seek.
+// Prebuffered input stream for unseekable sources like internet radio; keeps a rewind window alive up to WINDOW_CAP so ma_decoder_init can probe formats on a socket that cannot itself rewind.
 class prebuffer_istreambuf : public Poco::BasicBufferedStreamBuf<char, std::char_traits<char>> {
 	static const std::size_t WINDOW_CAP = 256 * 1024;
 	std::istream* source;

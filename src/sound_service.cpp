@@ -325,10 +325,7 @@ private:
 	static ma_result onRead(ma_vfs *pVFS, ma_vfs_file file, void *pDst, size_t sizeInBytes, size_t *pBytesRead) {
 		if (pBytesRead) *pBytesRead = 0;
 		file_cast(file);
-		// Only a real end of stream stops a read. A failbit left behind by a refused seek must not be
-		// mistaken for one: a live stream refuses every seek it cannot satisfy, and ma_decoder_init
-		// asks for the length before it probes any format, so treating that as the end meant the very
-		// first probe poisoned every read after it and no backend ever saw a byte.
+		// Only a real end of stream stops a read; a failbit left behind by a refused seek (a live stream refuses seeks it can't satisfy) must not be mistaken for one.
 		if (stream->eof()) return MA_AT_END;
 		if (!stream->good()) stream->clear();
 		stream->read((char *)pDst, sizeInBytes);
