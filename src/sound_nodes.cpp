@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <Poco/NotificationQueue.h>
 #include <Poco/Thread.h>
+#include <ma_plate_node.h>
 #include <ma_reverb_node.h>
 #include "misc_functions.h" // range_convert
 #include "sound_nodes.h"
@@ -471,6 +472,51 @@ class freeverb_node_impl : public audio_node_impl, public virtual freeverb_node 
 	bool get_frozen() const override { return rn? verblib_get_mode(&rn->reverb) >= 0.5 : false; }
 };
 freeverb_node* freeverb_node::create(audio_engine* e) { return new freeverb_node_impl(e); }
+
+class plate_reverb_node_impl : public audio_node_impl, public virtual plate_reverb_node {
+	unique_ptr<ma_plate_node> pn;
+	public:
+	plate_reverb_node_impl(audio_engine* e) : pn(make_unique<ma_plate_node>()), audio_node_impl(nullptr, e) {
+		ma_plate_node_config cfg = ma_plate_node_config_init(e->get_channels(), e->get_sample_rate());
+		if ((g_soundsystem_last_error = ma_plate_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*pn)) != MA_SUCCESS) throw std::runtime_error("ma_plate_node was not initialized");
+		node = (ma_node_base*)&*pn;
+	}
+	~plate_reverb_node_impl() {
+		if (pn) ma_plate_node_uninit(&*pn, nullptr);
+	}
+	void set_predelay(float seconds) override { if (pn) plateverb_set_predelay(&pn->reverb, seconds); }
+	float get_predelay() const override { return pn? plateverb_get_predelay(&pn->reverb) : -1; }
+	void set_bandwidth(float bandwidth) override { if (pn) plateverb_set_bandwidth(&pn->reverb, bandwidth); }
+	float get_bandwidth() const override { return pn? plateverb_get_bandwidth(&pn->reverb) : -1; }
+	void set_decay(float decay) override { if (pn) plateverb_set_decay(&pn->reverb, decay); }
+	float get_decay() const override { return pn? plateverb_get_decay(&pn->reverb) : -1; }
+	void set_damping(float damping) override { if (pn) plateverb_set_damping(&pn->reverb, damping); }
+	float get_damping() const override { return pn? plateverb_get_damping(&pn->reverb) : -1; }
+	void set_size(float size) override { if (pn) plateverb_set_size(&pn->reverb, size); }
+	float get_size() const override { return pn? plateverb_get_size(&pn->reverb) : -1; }
+	void set_input_diffusion_1(float diffusion) override { if (pn) plateverb_set_input_diffusion_1(&pn->reverb, diffusion); }
+	float get_input_diffusion_1() const override { return pn? plateverb_get_input_diffusion_1(&pn->reverb) : -1; }
+	void set_input_diffusion_2(float diffusion) override { if (pn) plateverb_set_input_diffusion_2(&pn->reverb, diffusion); }
+	float get_input_diffusion_2() const override { return pn? plateverb_get_input_diffusion_2(&pn->reverb) : -1; }
+	void set_decay_diffusion_1(float diffusion) override { if (pn) plateverb_set_decay_diffusion_1(&pn->reverb, diffusion); }
+	float get_decay_diffusion_1() const override { return pn? plateverb_get_decay_diffusion_1(&pn->reverb) : -1; }
+	void set_decay_diffusion_2(float diffusion) override { if (pn) plateverb_set_decay_diffusion_2(&pn->reverb, diffusion); }
+	float get_decay_diffusion_2() const override { return pn? plateverb_get_decay_diffusion_2(&pn->reverb) : -1; }
+	void set_modulation_depth(float depth) override { if (pn) plateverb_set_modulation_depth(&pn->reverb, depth); }
+	float get_modulation_depth() const override { return pn? plateverb_get_modulation_depth(&pn->reverb) : -1; }
+	void set_modulation_rate(float hz) override { if (pn) plateverb_set_modulation_rate(&pn->reverb, hz); }
+	float get_modulation_rate() const override { return pn? plateverb_get_modulation_rate(&pn->reverb) : -1; }
+	void set_wet(float wet) override { if (pn) plateverb_set_wet(&pn->reverb, wet); }
+	float get_wet() const override { return pn? plateverb_get_wet(&pn->reverb) : -1; }
+	void set_dry(float dry) override { if (pn) plateverb_set_dry(&pn->reverb, dry); }
+	float get_dry() const override { return pn? plateverb_get_dry(&pn->reverb) : -1; }
+	void set_width(float width) override { if (pn) plateverb_set_width(&pn->reverb, width); }
+	float get_width() const override { return pn? plateverb_get_width(&pn->reverb) : -1; }
+	void set_frozen(bool frozen) override { if (pn) plateverb_set_mode(&pn->reverb, frozen? 1.0f : 0.0f); }
+	bool get_frozen() const override { return pn? plateverb_get_mode(&pn->reverb) >= 0.5f : false; }
+	unsigned int get_decay_time_in_frames() const override { return pn? (unsigned int)plateverb_get_decay_time_in_frames(&pn->reverb) : 0; }
+};
+plate_reverb_node* plate_reverb_node::create(audio_engine* e) { return new plate_reverb_node_impl(e); }
 
 class reverb3d_impl : public passthrough_node_impl, public virtual reverb3d {
 	audio_node* reverb;

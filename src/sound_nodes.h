@@ -199,6 +199,41 @@ class freeverb_node : public virtual audio_node {
 	virtual bool get_frozen() const = 0;
 	static freeverb_node* create(audio_engine* engine);
 };
+class plate_reverb_node : public virtual audio_node {
+	public:
+	virtual void set_predelay(float seconds) = 0;
+	virtual float get_predelay() const = 0;
+	virtual void set_bandwidth(float bandwidth) = 0;
+	virtual float get_bandwidth() const = 0;
+	virtual void set_decay(float decay) = 0;
+	virtual float get_decay() const = 0;
+	virtual void set_damping(float damping) = 0;
+	virtual float get_damping() const = 0;
+	virtual void set_size(float size) = 0;
+	virtual float get_size() const = 0;
+	virtual void set_input_diffusion_1(float diffusion) = 0;
+	virtual float get_input_diffusion_1() const = 0;
+	virtual void set_input_diffusion_2(float diffusion) = 0;
+	virtual float get_input_diffusion_2() const = 0;
+	virtual void set_decay_diffusion_1(float diffusion) = 0;
+	virtual float get_decay_diffusion_1() const = 0;
+	virtual void set_decay_diffusion_2(float diffusion) = 0;
+	virtual float get_decay_diffusion_2() const = 0;
+	virtual void set_modulation_depth(float depth) = 0;
+	virtual float get_modulation_depth() const = 0;
+	virtual void set_modulation_rate(float hz) = 0;
+	virtual float get_modulation_rate() const = 0;
+	virtual void set_wet(float wet) = 0;
+	virtual float get_wet() const = 0;
+	virtual void set_dry(float dry) = 0;
+	virtual float get_dry() const = 0;
+	virtual void set_width(float width) = 0;
+	virtual float get_width() const = 0;
+	virtual void set_frozen(bool frozen) = 0;
+	virtual bool get_frozen() const = 0;
+	virtual unsigned int get_decay_time_in_frames() const = 0;
+	static plate_reverb_node* create(audio_engine* engine);
+};
 class reverb3d : public virtual passthrough_node {
 public:
 	virtual void set_reverb(audio_node* verb) = 0;
