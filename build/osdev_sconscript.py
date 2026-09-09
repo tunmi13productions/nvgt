@@ -31,12 +31,17 @@ def set_osdev_paths(env, osdev_path = ARGUMENTS.get("deps_path", prefix + "dev")
 	if not "deps_path" in ARGUMENTS and Path(osdev_path + "_path").exists(): osdev_path = Path(osdev_path).read_text()
 	else: osdev_path = Path("#" + osdev_path)
 	env.Append(CPPPATH = [str(osdev_path / "include")])
-	if ARGUMENTS.get("debug", "0") == "1": env.Prepend(LIBPATH = [str(osdev_path / "debug" / "lib")])
 	env.Prepend(LIBPATH = [str(osdev_path / "lib")])
+	# Prepended AFTER the release lib path (not before) on purpose: Prepend always wins the front of
+	# the list, so doing this one second is what makes it actually take priority over the release
+	# path above for a debug build. Doing it in the other order (as this used to) left the release
+	# path in front, so the linker picked up release-runtime (/MT) Poco libs even with debug=1,
+	# which fails to link against this debug build's own /MTd object files with LNK2038.
+	if ARGUMENTS.get("debug", "0") == "1": env.Prepend(LIBPATH = [str(osdev_path / "debug" / "lib")])
 	env["NVGT_OSDEV_PATH"] = str(Dir(osdev_path))
 	if env["NVGT_TARGET"] == "windows":
-		if ARGUMENTS.get("debug", "0") == "1": env.Prepend(LIBPATH = [str(osdev_path / "debug" / "bin")])
 		env.Prepend(LIBPATH = [str(osdev_path / "bin")])
+		if ARGUMENTS.get("debug", "0") == "1": env.Prepend(LIBPATH = [str(osdev_path / "debug" / "bin")])
 
 set_osdev_paths(env)
 
