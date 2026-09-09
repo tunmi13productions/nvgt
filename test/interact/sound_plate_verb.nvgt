@@ -39,13 +39,13 @@ void main() {
 			step.play();
 		}
 		// Decay and damping are safe to sweep while audio runs, so they are on the arrow-free keys.
-		if (key_pressed(KEY_A)) { plate.decay = maximum(0.0, plate.decay - 0.1); describe(); }
-		else if (key_pressed(KEY_S)) { plate.decay = minimum(0.999, plate.decay + 0.1); describe(); }
-		else if (key_pressed(KEY_D)) { plate.damping = maximum(0.0, plate.damping - 0.1); describe(); }
-		else if (key_pressed(KEY_F)) { plate.damping = minimum(1.0, plate.damping + 0.1); describe(); }
+		if (key_pressed(KEY_A)) { plate.decay = dmax(0.0, plate.decay - 0.1); describe(); }
+		else if (key_pressed(KEY_S)) { plate.decay = dmin(0.999, plate.decay + 0.1); describe(); }
+		else if (key_pressed(KEY_D)) { plate.damping = dmax(0.0, plate.damping - 0.1); describe(); }
+		else if (key_pressed(KEY_F)) { plate.damping = dmin(1.0, plate.damping + 0.1); describe(); }
 		// Size retunes every delay at once, so it clicks. It is a setting, not a sweep.
-		else if (key_pressed(KEY_G)) { plate.size = maximum(0.1, plate.size - 0.2); describe(); }
-		else if (key_pressed(KEY_H)) { plate.size = minimum(2.0, plate.size + 0.2); describe(); }
+		else if (key_pressed(KEY_G)) { plate.size = dmax(0.1, plate.size - 0.2); describe(); }
+		else if (key_pressed(KEY_H)) { plate.size = dmin(2.0, plate.size + 0.2); describe(); }
 		else if (key_pressed(KEY_SPACE)) { plate.frozen = !plate.frozen; screen_reader_speak(plate.frozen? "frozen" : "thawed", true); }
 	}
 }
