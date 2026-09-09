@@ -1,0 +1,39 @@
+void test_logging() {
+	string path = "tmp/logging_case.log";
+	file_delete(path);
+	assert(!log_running);
+	assert(log_start(path, LOG_INFO));
+	assert(log_running);
+	assert(log_path.length() > 0);
+	assert(logging_level == LOG_INFO);
+
+	log_info("an informational line");
+	log_error("an error line");
+	log_debug("a debug line that the level should drop");
+
+	logger@ net = logger("case.net");
+	assert(net.name == "case.net");
+	net.warning("a warning from a named channel");
+
+	// A channel with its own level is not held to the global one.
+	set_log_channel_level("case.net", LOG_TRACE);
+	assert(net.is_enabled_for(LOG_TRACE));
+	net.trace("a trace line that the channel level should keep");
+
+	// The log file is held open while it is running, so it is closed before being read back.
+	log_stop();
+	assert(!log_running);
+	string written = file_get_contents(path);
+
+	assert(written.find("an informational line") >= 0);
+	assert(written.find("an error line") >= 0);
+	assert(written.find("a debug line that the level should drop") < 0);
+	assert(written.find("a warning from a named channel") >= 0);
+	assert(written.find("case.net") >= 0);
+	assert(written.find("a trace line that the channel level should keep") >= 0);
+
+	// The date and time are announced once per group rather than repeated on every line.
+	assert(written.find("info app: an informational line") >= 0);
+
+	file_delete(path);
+}

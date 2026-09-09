@@ -37,6 +37,7 @@ typedef void* native_window_t;
 #endif
 #endif
 #include <angelscript.h>
+#include "logging.h"
 #include <scriptarray.h>
 #include <Poco/AutoPtr.h>
 #include <string>
@@ -47,7 +48,8 @@ typedef void* native_window_t;
 int message_box(const std::string& title, const std::string& text, const std::vector < std::string > & buttons, unsigned int mb_flags = 0);
 int alert(const std::string& title, const std::string& text, bool can_cancel = false, unsigned int flags = 0);
 int question(const std::string& title, const std::string& text, bool can_cancel = false, unsigned int flags = 0);
-void message(const std::string& text, const std::string& header);
+// Prints or shows a message from NVGT itself, recording it in the log at the given level. Most callers are reporting a failure, so the default suits them.
+void message(const std::string& text, const std::string& header, int log_level = NVGT_LOG_ERROR);
 bool info_box(const std::string& title, const std::string& text, const std::string& value);
 bool ClipboardSetText(const std::string& text);
 std::string simple_file_open_dialog(const std::string& filters = "All files:*", const std::string& default_location = "");

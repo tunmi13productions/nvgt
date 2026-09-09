@@ -37,6 +37,8 @@
 #include <SDL3/SDL.h>
 #include "nvgt_angelscript.h"
 #include "bundling.h"
+#include "crash_handler.h"
+#include "logging.h"
 #include "compression.h"
 #include "cppmath.h"
 #include "crypto.h"
@@ -265,6 +267,8 @@ int g_scriptMessagesErrNum;
 void ShowAngelscriptMessages() {
 	if (g_scriptMessagesErr == "" && g_scriptMessagesWarn == "" && g_scriptMessagesLine0 == "")
 		return;
+	if (g_scriptMessagesErrNum) NVGT_ERROR("nvgt.compiler", g_scriptMessagesErr != "" ? g_scriptMessagesErr : g_scriptMessagesLine0);
+	if (g_scriptMessagesWarn != "") NVGT_WARN("nvgt.compiler", g_scriptMessagesWarn);
 	#ifdef _WIN32
 	if (Util::Application::instance().config().hasOption("application.gui")) {
 		if (g_scriptMessagesErrNum)
@@ -367,6 +371,9 @@ void TranslateException(asIScriptContext *ctx, void* /*userParam*/) {
 	} catch (std::exception &e) {
 		ctx->SetException(e.what());
 	} catch (...) {
+		// Anything else here is a native fault that Angelscript caught on our behalf. Swallowing it silently is how a crash turns into nothing at all, so the report gathered when the fault happened is written out and the script is told what went wrong.
+		crash_handler_commit_pending();
+		ctx->SetException(crash_handler_pending_description().c_str());
 	}
 }
 void Exit(int retcode = 0) {
@@ -447,6 +454,7 @@ int ConfigureEngine(asIScriptEngine *engine) {
 	Print::asRegister(engine);
 	engine->SetDefaultAccessMask(NVGT_SUBSYSTEM_GENERAL);
 	RegisterExceptionRoutines(engine);
+	RegisterLogging(engine);
 	engine->RegisterGlobalProperty("const string last_exception_call_stack", &g_last_exception_callstack);
 	engine->EndConfigGroup();
 	engine->SetDefaultAccessMask(NVGT_SUBSYSTEM_GENERAL);
@@ -670,6 +678,13 @@ int CompileScript(asIScriptEngine *engine, const string &scriptFile) {
 	}
 	return 0;
 }
+// A configuration key can carry both a value and children, so both are collected.
+static void collect_config_keys(AbstractConfiguration& config, const std::string& root, std::vector<std::string>& out) {
+	if (config.hasProperty(root)) out.push_back(root);
+	std::vector<std::string> children;
+	config.keys(root, children);
+	for (const std::string& child : children) collect_config_keys(config, root + "." + child, out);
+}
 int SaveCompiledScript(asIScriptEngine *engine, unsigned char** output) {
 	asIScriptModule *mod = engine->GetModule("nvgt_game", asGM_ONLY_IF_EXISTS);
 	if (mod == 0)
@@ -684,6 +699,11 @@ int SaveCompiledScript(asIScriptEngine *engine, unsigned char** output) {
 		bw.write7BitEncoded(UInt64(engine->GetEngineProperty(asEEngineProp(i))));
 	bw << Timestamp().raw();
 	bw << Application::instance().config().has("app.no_auto_chdir");
+	// A compiled program never reads a configuration file of its own, so any logging.* property the script set with #pragma config has to travel inside it.
+	std::vector<std::string> log_keys;
+	collect_config_keys(Application::instance().config(), "logging", log_keys);
+	bw << int(log_keys.size());
+	for (const std::string& key : log_keys) bw << key << Application::instance().config().getString(key, "");
 	if (mod->SaveByteCode(&codestream, !g_debug) < 0)
 		return -1;
 	return codestream.get(output);
@@ -776,6 +796,13 @@ int LoadCompiledScript(asIScriptEngine *engine, unsigned char* code, asUINT size
 	bool no_auto_chdir;
 	br >> no_auto_chdir;
 	if (no_auto_chdir) Application::instance().config().setString("app.no_auto_chdir", "");
+	int log_key_count = 0;
+	br >> log_key_count;
+	for (int i = 0; i < log_key_count; i++) {
+		string key, value;
+		br >> key >> value;
+		Application::instance().config().setString(key, value);
+	}
 	codestream.reset_cursor(); // Angelscript can produce bytecode load failures as a result of user misconfigurations or bugs, and such failures only include an offset of bytes read maintained by Angelscript internally. The solution in such cases is to breakpoint NVGTBytecodeStream::Read if cursor is greater than the offset given, then one can get more debug info. For that to work, we make sure that the codestream's variable that tracks number of bytes written does not include the count of those written by engine properties, plugins etc. We could theoretically store such data at the end of the stream instead of the beginning and avoid this, but then we are trusting Angelscript to read exactly the number of bytes it's written, and since I don't know how much of a gamble that is, I opted for this instead.
 	if (mod->LoadByteCode(&codestream, &g_debug) < 0)
 		return -1;
@@ -874,6 +901,8 @@ int ExecuteScript(asIScriptEngine *engine, const string &scriptFile) {
 	if (r != asEXECUTION_FINISHED) {
 		if (r == asEXECUTION_EXCEPTION) {
 			string exc = GetExceptionInfo(ctx, true);
+			NVGT_CRITICAL("nvgt.script", "unhandled exception\r\n" + exc);
+			nvgt_log::flush();
 			string msg = exc + "\r\nCopy to clipboard?";
 			int c = question("unhandled exception", msg, false, SDL_MESSAGEBOX_ERROR);
 			if (c == 1)
@@ -882,6 +911,7 @@ int ExecuteScript(asIScriptEngine *engine, const string &scriptFile) {
 		} else if (r == asEXECUTION_ABORTED)
 			retcode = g_retcode;
 		else {
+			NVGT_CRITICAL("nvgt.script", "script terminated unexpectedly");
 			alert("script terminated", "script terminated unexpectedly");
 			retcode = -1;
 		}
@@ -956,13 +986,19 @@ int PragmaCallback(const string &pragmaText, CScriptBuilder &builder, void* /*us
 		if (g_bcCompressionLevel < 0 || g_bcCompressionLevel > 9)
 			return -1;
 	} else if (cleanText.starts_with("config ")) {
-		int sep = cleanText.find("=");
+		// Tokenizing splits a dotted property name into three tokens with spaces between them, so the key and value are taken from the original text rather than from cleanText.
+		string raw = trim(trim(pragmaText).substr(6));
 		string key, value;
-		if (sep == string::npos) key = trim(cleanText.substr(7));
+		string::size_type sep = raw.find("=");
+		if (sep == string::npos) sep = raw.find_first_of(" 	");
+		if (sep == string::npos) key = raw;
 		else {
-			key = trim(cleanText.substr(7, sep - 7));
-			value = trim(cleanText.substr(sep + 1));
+			key = trim(raw.substr(0, sep));
+			value = trim(raw.substr(sep + 1));
 		}
+		if (value.starts_with("\"")) value.erase(0, 1);
+		if (value.ends_with("\"")) value.pop_back();
+		if (key.empty()) return -1;
 		config.setString(key, value);
 	} else if (cleanText.starts_with("namespace")) {
 		string ns = cleanText.substr(10);

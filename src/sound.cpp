@@ -23,6 +23,7 @@
 #include <scriptarray.h>
 #include <scripthandle.h>
 #include "filesystem.h" // FileExists, FileDelete
+#include "logging.h"
 #include "misc_functions.h" // script_memory_buffer
 #include "nvgt.h" // g_ScriptEngine
 #include "nvgt_angelscript.h" // get_array_type
@@ -73,6 +74,14 @@ bool add_decoder(ma_decoding_backend_vtable *vtable) {
 		return false;
 	}
 }
+static void miniaudio_log_callback(void* /*user_data*/, ma_uint32 level, const char* message) {
+	if (!message) return;
+	int priority = level == MA_LOG_LEVEL_ERROR ? NVGT_LOG_ERROR : level == MA_LOG_LEVEL_WARNING ? NVGT_LOG_WARN : level == MA_LOG_LEVEL_INFO ? NVGT_LOG_INFO : NVGT_LOG_DEBUG;
+	if (!nvgt_log::enabled(priority)) return;
+	string text = message;
+	while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+	nvgt_log::write("nvgt.sound.miniaudio", priority, text);
+}
 bool init_sound() {
 	if (g_soundsystem_initialized.test()) return true;
 	#ifdef __linux__
@@ -84,10 +93,15 @@ bool init_sound() {
 	#endif
 	ma_context_config cfg = ma_context_config_init();
 	cfg.coreaudio.sessionCategoryOptions = ma_ios_session_category_option_mix_with_others | ma_ios_session_category_option_allow_bluetooth_a2dp | ma_ios_session_category_option_allow_air_play;
-	if ((g_soundsystem_last_error = ma_context_init(nullptr, 0, &cfg, &g_sound_context)) != MA_SUCCESS)
+	if ((g_soundsystem_last_error = ma_context_init(nullptr, 0, &cfg, &g_sound_context)) != MA_SUCCESS) {
+		NVGT_ERROR("nvgt.sound", Poco::format("audio context could not be created: %s (%d)", string(ma_result_description(g_soundsystem_last_error)), int(g_soundsystem_last_error)));
 		return false;
+	}
+	// Miniaudio has a great deal to say about why a backend refused to start, and none of it used to reach anybody.
+	ma_log_register_callback(ma_context_get_log(&g_sound_context), ma_log_callback_init(miniaudio_log_callback, nullptr));
 	g_sound_service = sound_service::make();
 	if (g_sound_service == nullptr) {
+		NVGT_ERROR("nvgt.sound", "the sound service could not be created");
 		ma_context_uninit(&g_sound_context);
 		return false;
 	}
@@ -1628,6 +1642,7 @@ public:
 		// The sound service converts our file name into a "tripplet" which includes information about the origin an asset is expected to come from. This guarantees that we don't mistake assets from different origins as the same just because they have the same name.
 		std::string triplet = g_sound_service->prepare_triplet(filename, protocol_slot, protocol_directive, filter_slot, filter_directive);
 		if (triplet.empty()) {
+			NVGT_ERROR("nvgt.sound", Poco::format("could not load %s, the sound service refused to resolve it, usually a missing file or an unreadable pack", filename));
 			snd.reset();
 			return false;
 		}
@@ -1658,9 +1673,13 @@ public:
 			g_soundsystem_last_error = ma_sound_init_ex(engine->get_ma_engine(), &cfg, &*snd);
 		}
 
-		if (g_soundsystem_last_error != MA_SUCCESS)
+		if (g_soundsystem_last_error != MA_SUCCESS) {
+			NVGT_ERROR("nvgt.sound", Poco::format("could not load %s: %s (%d)", filename, string(ma_result_description(g_soundsystem_last_error)), int(g_soundsystem_last_error)));
 			snd.reset();
-		else postload(filename, (cfg.flags & MA_SOUND_FLAG_ASYNC));
+		} else {
+			NVGT_DEBUG("nvgt.sound", Poco::format("loaded %s", filename));
+			postload(filename, (cfg.flags & MA_SOUND_FLAG_ASYNC));
+		}
 		// Sound service has to store data pertaining to our triplet, and this is the earliest point at which it's safe to clean that up.
 		g_sound_service->cleanup_triplet(triplet);
 		return g_soundsystem_last_error == MA_SUCCESS;

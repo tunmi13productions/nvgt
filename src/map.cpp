@@ -14,6 +14,7 @@
 #define NOMINMAX
 #define _USE_MATH_DEFINES
 #include <cmath>
+#include "logging.h"
 #include "map.h"
 #include <algorithm>
 #include <obfuscate.h>
@@ -122,6 +123,16 @@ bool map_area::is_unfiltered(asIScriptFunction* filter_callback) {
 	} else ctx = ACtx;
 	bool ret = true;
 	if (!ctx || ctx->Prepare(filter_callback) < 0 || ctx->SetArgObject(0, this) < 0 || ctx->Execute() != asEXECUTION_FINISHED) {
+		// The area counts as unfiltered when the callback cannot run, which looks exactly like a filter that decided to keep it. The log is the only place that difference shows up.
+		if (nvgt_log::enabled(NVGT_LOG_ERROR)) {
+			std::string reason = "the filter callback could not be run";
+			if (ctx && ctx->GetState() == asEXECUTION_EXCEPTION) {
+				const char* text = ctx->GetExceptionString();
+				reason = std::string("the filter callback threw: ") + (text ? text : "an exception with no description");
+			}
+			const char* name = filter_callback->GetDeclaration();
+			nvgt_log::write("nvgt.map", NVGT_LOG_ERROR, reason + ", so " + (name ? name : "the callback") + " was treated as accepting this area");
+		}
 		if (!new_context && ctx) ctx->PopState();
 		return true;
 	}

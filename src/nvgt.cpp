@@ -38,7 +38,9 @@
 #include "scriptarray.h"
 #include "nvgt_angelscript.h" // nvgt's angelscript implementation
 #include "bundling.h"
+#include "crash_handler.h"
 #include "input.h"
+#include "logging.h"
 #include "misc_functions.h" // ChDir
 #include "nvgt.h"
 #ifndef NVGT_USER_CONFIG
@@ -118,6 +120,8 @@ protected:
 		#if defined(NVGT_WIN_APP) || defined(NVGT_STUB)
 		config().setString("application.gui", "");
 		#endif
+		// The crash handler is installed whether or not logging was switched on, because the whole point of it is to leave something behind when a player hits a fault nobody knew about. Logging itself starts later, once the directory the log belongs in is known.
+		if (nvgt_log::option("logging.crash", true)) crash_handler_install(nvgt_log::option("logging.crash_alert", true));
 		g_ScriptEngine = asCreateScriptEngine();
 		if (!g_ScriptEngine || PreconfigureEngine(g_ScriptEngine) < 0) throw ApplicationException("unable to initialize script engine");
 	}
@@ -149,6 +153,8 @@ protected:
 		options.addOption(Option("include-directory", "I", "add an aditional directory to the search path for included scripts", false, "directory", true).repeatable(true));
 		options.addOption(Option("set", "s", "set a configuration property", false, "name=value", true).repeatable(true));
 		options.addOption(Option("settings", "S", "set additional configuration properties from a file", false, "path", true).repeatable(true));
+		options.addOption(Option("log", "l", "write a log while running, level is one of off, critical, error, warning, info, debug or trace (default debug)", false, "level", false));
+		options.addOption(Option("log-file", "L", "path of the file that --log writes to (default errors.log next to the program)", false, "path", true));
 		options.addOption(Option("version", "V", "print version information and exit"));
 		options.addOption(Option("help", "h", "display available command line options"));
 	}
@@ -175,6 +181,11 @@ protected:
 			defineSetting(value);
 		else if (name == "settings")
 			loadConfiguration(value);
+		else if (name == "log") {
+			config().setString("logging.enabled", "1");
+			config().setString("logging.level", value.empty() ? "debug" : value);
+		} else if (name == "log-file")
+			config().setString("logging.file", value);
 		else if (name == "platform")
 			g_platform = value;
 	}
@@ -203,7 +214,7 @@ protected:
 		else {
 			stringstream ss;
 			hf.format(ss);
-			message(ss.str(), "help");
+			message(ss.str(), "help", NVGT_LOG_INFO);
 		}
 	}
 	std::string UILauncher() {
@@ -263,7 +274,7 @@ protected:
 		} else if (mode == NVGT_VERSIONINFO) {
 			string ver = format("NVGT (NonVisual Gaming Toolkit) version %s, built on %s for %s %s", NVGT_VERSION, NVGT_VERSION_BUILD_TIME, Environment::osName(), Environment::osArchitecture());
 			if (config().hasOption("application.gui"))
-				message(ver, "version information");
+				message(ver, "version information", NVGT_LOG_INFO);
 			else
 				cout << ver << endl;
 			return Application::EXIT_OK;
@@ -303,6 +314,8 @@ protected:
 		}
 		#endif
 		g_scriptpath = Path(scriptfile).makeAbsolute().makeParent().toString();
+		nvgt_log::configure();
+		crash_handler_refresh();
 		setupCommandLineProperty(args, 1);
 		g_command_line_args->InsertAt(0, (void*)&scriptfile);
 		ConfigureEngineOptions(g_ScriptEngine);
@@ -335,7 +348,14 @@ protected:
 		std::string path_tmp;
 		g_command_line_args->InsertAt(0, (void*)&path_tmp);
 		int retcode = Application::EXIT_OK;
-		if (LoadCompiledExecutable(g_ScriptEngine) < 0 || (retcode = ExecuteScript(g_ScriptEngine, commandName().c_str())) < 0) {
+		if (LoadCompiledExecutable(g_ScriptEngine) < 0) {
+			ShowAngelscriptMessages();
+			return Application::EXIT_DATAERR;
+		}
+		// The logging properties a script set with #pragma config travel inside the executable, so they only become visible once it has been loaded.
+		nvgt_log::configure();
+		crash_handler_refresh();
+		if ((retcode = ExecuteScript(g_ScriptEngine, commandName().c_str())) < 0) {
 			ShowAngelscriptMessages();
 			return Application::EXIT_DATAERR;
 		}
@@ -357,9 +377,18 @@ protected:
 		uninit_sound();
 		anticheat_deinit();
 		cleanup_default_random();
+		if (crash_handler_pending()) {
+			// A fault that something swallowed leaves the program apparently fine but quietly broken, so it gets written out and said out loud rather than silently discarded.
+			crash_handler_commit_pending();
+			std::string where = nvgt_log::path();
+			if (where.empty()) message("An internal error occurred during this run, and no log file could be opened to describe it.", "internal error");
+			else message("An internal error was recorded during this run. Details were written to " + where, "internal error");
+		} else crash_handler_commit_pending();
+		crash_handler_uninstall();
 		if (g_ScriptEngine)
 			g_ScriptEngine->ShutDownAndRelease();
 		g_ScriptEngine = nullptr;
+		nvgt_log::shutdown();
 	}
 };
 

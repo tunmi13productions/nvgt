@@ -54,6 +54,7 @@
 #include "misc_functions.h"
 #include "scriptstuff.h"
 #include "timestuff.h"
+#include "logging.h"
 #include "UI.h"
 #if defined(__APPLE__) || (!defined(__ANDROID__) && (defined(__linux__) || defined(__unix__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__))) || defined(__ANDROID__)
 	#include <unistd.h>
@@ -102,10 +103,11 @@ int question(const std::string& title, const std::string& text, bool can_cancel,
 	if (can_cancel) buttons.push_back("~Cancel");
 	return message_box(title, text, buttons, flags);
 }
-void message(const std::string& text, const std::string& header) { // Usually used internally by NVGT's c++ code to print an error first to stdout if that's available, then to a message box if that's enabled.
+void message(const std::string& text, const std::string& header, int log_level) { // Usually used internally by NVGT's c++ code to print an error first to stdout if that's available, then to a message box if that's enabled.
 	std::string tmp = header;
 	tmp += ": ";
 	tmp += text;
+	NVGT_LOG_AT("nvgt", log_level, tmp); // Every internal message routes through here, so this is the one place that has to record them.
 	if (Poco::Util::Application::instance().config().hasOption("application.gui")) {
 		alert(header, text);
 		return;
