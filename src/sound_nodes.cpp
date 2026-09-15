@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <Poco/NotificationQueue.h>
 #include <Poco/Thread.h>
+#include <ma_convolution_node.h>
 #include <ma_plate_node.h>
 #include <ma_reverb_node.h>
 #include "misc_functions.h" // range_convert
@@ -517,6 +518,64 @@ class plate_reverb_node_impl : public audio_node_impl, public virtual plate_reve
 	unsigned int get_decay_time_in_frames() const override { return pn? (unsigned int)plateverb_get_decay_time_in_frames(&pn->reverb) : 0; }
 };
 plate_reverb_node* plate_reverb_node::create(audio_engine* e) { return new plate_reverb_node_impl(e); }
+
+class convolution_reverb_node_impl : public audio_node_impl, public virtual convolution_reverb_node {
+	unique_ptr<ma_convolution_node> cn;
+	unsigned long long ir_length_frames;
+	bool ir_loaded;
+	public:
+	convolution_reverb_node_impl(audio_engine* e, unsigned int partition_size) : cn(make_unique<ma_convolution_node>()), audio_node_impl(nullptr, e), ir_length_frames(0), ir_loaded(false) {
+		ma_convolution_node_config cfg = ma_convolution_node_config_init(e->get_channels(), e->get_sample_rate());
+		if (partition_size) cfg.partitionSize = partition_size;
+		if ((g_soundsystem_last_error = ma_convolution_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*cn)) != MA_SUCCESS) throw std::runtime_error("ma_convolution_node was not initialized");
+		node = (ma_node_base*)&*cn;
+	}
+	~convolution_reverb_node_impl() {
+		if (cn) ma_convolution_node_uninit(&*cn, nullptr);
+	}
+	// Decoding goes through audio_decoder rather than a dedicated loader so the impulse response gets every format, pack file and resampling support the rest of the sound system already has, arriving pre-matched to the engine's sample rate and channel count.
+	bool load_ir(const std::string& filename, const pack_interface* pack_file) override {
+		if (!cn) return false;
+		audio_decoder* dec = audio_decoder::create(engine);
+		if (!dec) return false;
+		if (!dec->open(filename, pack_file, engine->get_sample_rate(), engine->get_channels())) {
+			dec->release();
+			return false;
+		}
+		unsigned long long total = dec->get_length_frames();
+		unsigned int channels = dec->get_channels();
+		if (total == 0 || channels == 0) {
+			dec->release();
+			return false;
+		}
+		vector<float> buffer(total * channels);
+		unsigned long long read_so_far = 0;
+		while (read_so_far < total) {
+			unsigned long long n = dec->read(buffer.data() + read_so_far * channels, total - read_so_far);
+			if (n == 0) break;
+			read_so_far += n;
+		}
+		dec->release();
+		if (read_so_far == 0) return false;
+		if ((g_soundsystem_last_error = ma_convolution_node_set_ir(&*cn, buffer.data(), read_so_far, channels, nullptr)) != MA_SUCCESS) return false;
+		ir_length_frames = read_so_far;
+		ir_loaded = true;
+		return true;
+	}
+	void clear_ir() override {
+		if (cn) ma_convolution_node_clear_ir(&*cn, nullptr);
+		ir_loaded = false;
+		ir_length_frames = 0;
+	}
+	bool get_ir_loaded() const override { return ir_loaded; }
+	unsigned long long get_ir_length_frames() const override { return ir_length_frames; }
+	float get_ir_length_ms() const override { return engine->get_sample_rate() > 0? (float)ir_length_frames / engine->get_sample_rate() * 1000.0f : 0.0f; }
+	void set_wet(float wet) override { if (cn) ma_convolution_node_set_wet(&*cn, wet); }
+	float get_wet() const override { return cn? ma_convolution_node_get_wet(&*cn) : 0.0f; }
+	void set_dry(float dry) override { if (cn) ma_convolution_node_set_dry(&*cn, dry); }
+	float get_dry() const override { return cn? ma_convolution_node_get_dry(&*cn) : 0.0f; }
+};
+convolution_reverb_node* convolution_reverb_node::create(audio_engine* e, unsigned int partition_size) { return new convolution_reverb_node_impl(e, partition_size); }
 
 class reverb3d_impl : public passthrough_node_impl, public virtual reverb3d {
 	audio_node* reverb;

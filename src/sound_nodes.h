@@ -234,6 +234,19 @@ class plate_reverb_node : public virtual audio_node {
 	virtual unsigned int get_decay_time_in_frames() const = 0;
 	static plate_reverb_node* create(audio_engine* engine);
 };
+class convolution_reverb_node : public virtual audio_node {
+	public:
+	virtual bool load_ir(const std::string& filename, const pack_interface* pack_file = nullptr) = 0;
+	virtual void clear_ir() = 0;
+	virtual bool get_ir_loaded() const = 0;
+	virtual unsigned long long get_ir_length_frames() const = 0;
+	virtual float get_ir_length_ms() const = 0;
+	virtual void set_wet(float wet) = 0;
+	virtual float get_wet() const = 0;
+	virtual void set_dry(float dry) = 0;
+	virtual float get_dry() const = 0;
+	static convolution_reverb_node* create(audio_engine* engine, unsigned int partition_size = 1024);
+};
 class reverb3d : public virtual passthrough_node {
 public:
 	virtual void set_reverb(audio_node* verb) = 0;
