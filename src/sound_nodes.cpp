@@ -44,12 +44,14 @@ effect_node_impl::effect_node_impl(audio_engine* e, ma_uint8 input_channel_count
 	cfg.vtable          = &vtable;
 	if (input_bus_count > 0) cfg.pInputChannels  = &channels_in[0];
 	if (output_bus_count > 0) cfg.pOutputChannels = &channels_out[0];
+	std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 	if ((g_soundsystem_last_error = ma_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, (ma_node_base*)&*n)) != MA_SUCCESS) throw std::runtime_error("failed to create effect node");
 	n->node = this;
 	node = (ma_node_base*)&*n;
 }
 effect_node_impl::~effect_node_impl() { destroy_node(); }
 void effect_node_impl::destroy_node() {
+	std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 	if (n) ma_node_uninit((ma_node_base*)&*n, nullptr);
 	n.reset();
 }
@@ -71,6 +73,7 @@ class audio_node_chain_impl : public passthrough_node_impl, public virtual audio
 	unsigned int endpoint_input_bus_index;
 public:
 	audio_node_chain_impl(audio_node* source, audio_node* endpoint, audio_engine* e) : passthrough_node_impl(e), endpoint(endpoint) {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (source) source->attach_output_bus(0, this, 0);
 		if (endpoint) attach_output_bus(0, endpoint, 0);
 	}
@@ -87,6 +90,7 @@ public:
 	bool detach_all_output_buses() override { return detach_output_bus(0); }
 	bool add_node(audio_node* node, audio_node* after, unsigned int input_bus_index) override {
 		if (!node) return false;
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		unsigned int new_idx = 0;
 		if (after) {
 			new_idx = index_of(after);
@@ -109,6 +113,7 @@ public:
 	}
 	bool remove_node(audio_node* node) override {
 		if (!node) return false;
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		auto it = find(nodes.begin(), nodes.end(), node);
 		if (it == nodes.end()) return false;
 		audio_node* prev = (*it) != nodes.front()? *(it -1) : nullptr;
@@ -125,6 +130,7 @@ public:
 		return remove_node(nodes[index]);
 	}
 	bool clear(bool detach_nodes) override {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		bool success = audio_node_impl::detach_output_bus(0);
 		for (audio_node* node : nodes) {
 			if (success && detach_nodes) success = node->detach_output_bus(0);
@@ -135,6 +141,7 @@ public:
 		return success;
 	}
 	void set_endpoint(audio_node* node, unsigned int input_bus_index) override {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (endpoint) {
 			if (!nodes.empty()) last()->detach_output_bus(0);
 			else audio_node_impl::detach_output_bus(0);
@@ -210,10 +217,12 @@ class phonon_binaural_node_impl : public audio_node_impl, public virtual phonon_
 			if (!frame_size) frame_size = SOUNDSYSTEM_FRAMESIZE;
 			IPLAudioSettings audio_settings {sample_rate, frame_size};
 			ma_phonon_binaural_node_config cfg = ma_phonon_binaural_node_config_init(channels, audio_settings, g_phonon_context, g_phonon_hrtf);
+			std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 			if ((g_soundsystem_last_error = ma_phonon_binaural_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*bn)) != MA_SUCCESS) throw std::runtime_error("phonon_binaural_node was not created");
 			node = (ma_node_base*)&*bn;
 		}
 		~phonon_binaural_node_impl() {
+			std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 			if (bn) ma_phonon_binaural_node_uninit(&*bn, nullptr);
 		}
 		void set_direction(float x, float y, float z, float distance) override { ma_phonon_binaural_node_set_direction(&*bn, x, y, z, distance); }
@@ -227,10 +236,12 @@ class splitter_node_impl : public audio_node_impl, public virtual splitter_node 
 	public:
 	splitter_node_impl(audio_engine* e, int channels) : sn(make_unique<ma_splitter_node>()), audio_node_impl(nullptr, e) {
 		ma_splitter_node_config cfg = ma_splitter_node_config_init(channels);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_splitter_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*sn)) != MA_SUCCESS) throw std::runtime_error("ma_splitter_node was not initialized");
 		node = (ma_node_base*)&*sn;
 	}
 	~splitter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (sn) ma_splitter_node_uninit(&*sn, nullptr);
 	}
 };
@@ -242,10 +253,12 @@ class low_pass_filter_node_impl : public audio_node_impl, public virtual low_pas
 	public:
 	low_pass_filter_node_impl(double cutoff_frequency, int order, audio_engine* e) : fn(make_unique<ma_lpf_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_lpf_node_config_init(e->get_channels(), e->get_sample_rate(), cutoff_frequency, order);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_lpf_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_low_pass_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~low_pass_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_lpf_node_uninit(&*fn, nullptr);
 	}
 	void set_cutoff_frequency(double freq) override {
@@ -267,10 +280,12 @@ class high_pass_filter_node_impl : public audio_node_impl, public virtual high_p
 	public:
 	high_pass_filter_node_impl(double cutoff_frequency, int order, audio_engine* e) : fn(make_unique<ma_hpf_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_hpf_node_config_init(e->get_channels(), e->get_sample_rate(), cutoff_frequency, order);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_hpf_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_high_pass_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~high_pass_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_hpf_node_uninit(&*fn, nullptr);
 	}
 	void set_cutoff_frequency(double freq) override {
@@ -292,10 +307,12 @@ class band_pass_filter_node_impl : public audio_node_impl, public virtual band_p
 	public:
 	band_pass_filter_node_impl(double cutoff_frequency, int order, audio_engine* e) : fn(make_unique<ma_bpf_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_bpf_node_config_init(e->get_channels(), e->get_sample_rate(), cutoff_frequency, order);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_bpf_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_band_pass_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~band_pass_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_bpf_node_uninit(&*fn, nullptr);
 	}
 	void set_cutoff_frequency(double freq) override {
@@ -317,10 +334,12 @@ class notch_filter_node_impl : public audio_node_impl, public virtual notch_filt
 	public:
 	notch_filter_node_impl(double q, double frequency, audio_engine* e) : fn(make_unique<ma_notch_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_notch_node_config_init(e->get_channels(), e->get_sample_rate(), q, frequency);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_notch_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_notch_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~notch_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_notch_node_uninit(&*fn, nullptr);
 	}
 	void set_q(double q) override {
@@ -342,10 +361,12 @@ class peak_filter_node_impl : public audio_node_impl, public virtual peak_filter
 	public:
 	peak_filter_node_impl(double gain_db, double q, double frequency, audio_engine* e) : fn(make_unique<ma_peak_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_peak_node_config_init(e->get_channels(), e->get_sample_rate(), gain_db, q, frequency);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_peak_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_peak_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~peak_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_peak_node_uninit(&*fn, nullptr);
 	}
 	void set_gain(double gain) override {
@@ -372,10 +393,12 @@ class low_shelf_filter_node_impl : public audio_node_impl, public virtual low_sh
 	public:
 	low_shelf_filter_node_impl(double gain_db, double q, double frequency, audio_engine* e) : fn(make_unique<ma_loshelf_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_loshelf_node_config_init(e->get_channels(), e->get_sample_rate(), gain_db, q, frequency);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_loshelf_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_low_shelf_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~low_shelf_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_loshelf_node_uninit(&*fn, nullptr);
 	}
 	void set_gain(double gain) override {
@@ -402,10 +425,12 @@ class high_shelf_filter_node_impl : public audio_node_impl, public virtual high_
 	public:
 	high_shelf_filter_node_impl(double gain_db, double q, double frequency, audio_engine* e) : fn(make_unique<ma_hishelf_node>()), audio_node_impl(nullptr, e) {
 		cfg = ma_hishelf_node_config_init(e->get_channels(), e->get_sample_rate(), gain_db, q, frequency);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_hishelf_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*fn)) != MA_SUCCESS) throw std::runtime_error("ma_high_shelf_filter_node was not initialized");
 		node = (ma_node_base*)&*fn;
 	}
 	~high_shelf_filter_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (fn) ma_hishelf_node_uninit(&*fn, nullptr);
 	}
 	void set_gain(double gain) override {
@@ -431,10 +456,12 @@ class delay_node_impl : public audio_node_impl, public virtual delay_node {
 	public:
 	delay_node_impl(unsigned int delay_in_frames, float decay, audio_engine* e) : dn(make_unique<ma_delay_node>()), audio_node_impl(nullptr, e) {
 		ma_delay_node_config cfg = ma_delay_node_config_init(e->get_channels(), e->get_sample_rate(), delay_in_frames, decay);
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_delay_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*dn)) != MA_SUCCESS) throw std::runtime_error("ma_delay_node was not initialized");
 		node = (ma_node_base*)&*dn;
 	}
 	~delay_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (dn) ma_delay_node_uninit(&*dn, nullptr);
 	}
 	void set_wet(float wet) override { ma_delay_node_set_wet(&*dn, wet); }
@@ -451,10 +478,12 @@ class freeverb_node_impl : public audio_node_impl, public virtual freeverb_node 
 	public:
 	freeverb_node_impl(audio_engine* e) : rn(make_unique<ma_reverb_node>()), audio_node_impl(nullptr, e) {
 		ma_reverb_node_config cfg = ma_reverb_node_config_init(e->get_channels(), e->get_sample_rate());
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_reverb_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*rn)) != MA_SUCCESS) throw std::runtime_error("ma_reverb_node was not initialized");
 		node = (ma_node_base*)&*rn;
 	}
 	~freeverb_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (rn) ma_reverb_node_uninit(&*rn, nullptr);
 	}
 	void set_room_size(float size) override { if (rn) verblib_set_room_size(&rn->reverb, size); }
@@ -479,10 +508,12 @@ class plate_reverb_node_impl : public audio_node_impl, public virtual plate_reve
 	public:
 	plate_reverb_node_impl(audio_engine* e) : pn(make_unique<ma_plate_node>()), audio_node_impl(nullptr, e) {
 		ma_plate_node_config cfg = ma_plate_node_config_init(e->get_channels(), e->get_sample_rate());
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_plate_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*pn)) != MA_SUCCESS) throw std::runtime_error("ma_plate_node was not initialized");
 		node = (ma_node_base*)&*pn;
 	}
 	~plate_reverb_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (pn) ma_plate_node_uninit(&*pn, nullptr);
 	}
 	void set_predelay(float seconds) override { if (pn) plateverb_set_predelay(&pn->reverb, seconds); }
@@ -527,10 +558,12 @@ class convolution_reverb_node_impl : public audio_node_impl, public virtual conv
 	convolution_reverb_node_impl(audio_engine* e, unsigned int partition_size) : cn(make_unique<ma_convolution_node>()), audio_node_impl(nullptr, e), ir_length_frames(0), ir_loaded(false) {
 		ma_convolution_node_config cfg = ma_convolution_node_config_init(e->get_channels(), e->get_sample_rate());
 		if (partition_size) cfg.partitionSize = partition_size;
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_convolution_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*cn)) != MA_SUCCESS) throw std::runtime_error("ma_convolution_node was not initialized");
 		node = (ma_node_base*)&*cn;
 	}
 	~convolution_reverb_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (cn) ma_convolution_node_uninit(&*cn, nullptr);
 	}
 	// Decoding goes through audio_decoder rather than a dedicated loader so the impulse response gets every format, pack file and resampling support the rest of the sound system already has, arriving pre-matched to the engine's sample rate and channel count.
@@ -678,10 +711,12 @@ class plugin_node_impl : public audio_node_impl, public virtual plugin_node {
 		cfg.vtable          = &vtable;
 		cfg.pInputChannels  = &channels;
 		cfg.pOutputChannels = &channels;
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_node_init(ma_engine_get_node_graph(engine->get_ma_engine()), &cfg, nullptr, (ma_node_base*)&*pn)) != MA_SUCCESS) throw std::runtime_error("failed to create plugin_node");
 		node = (ma_node_base*)&*pn;
 	}
 	~plugin_node_impl() {
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (pn) ma_node_uninit(&*pn, nullptr);
 	}
 	audio_plugin_node_interface* get_plugin_interface() const override { return impl; }

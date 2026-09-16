@@ -58,6 +58,21 @@ audio_engine *g_audio_engine = nullptr;
 mixer* g_audio_mixer = nullptr;
 static std::atomic_flag g_soundsystem_initialized;
 std::atomic<ma_result> g_soundsystem_last_error = MA_SUCCESS;
+// Serializes every mutation of the shared audio node graph: initializing a node, uninitializing one, and attaching or
+// detaching a bus. Miniaudio's own spinlocks make attach/detach safe against the audio callback thread reading the graph,
+// but nothing makes two mutating threads safe against each other, and the graph is a single connected structure -- tearing
+// down one node walks its neighbours' bus lists (ma_node_detach_full), so it reads memory another thread may be freeing.
+// A per-object lock therefore cannot work; the lock has to cover the graph.
+//
+// Recursive because the mutating paths nest: load_special() calls close(), close() calls node_chain->remove_node(), and a
+// mixer_impl constructor attaches its own output bus.
+//
+// Lock ordering, never taken in reverse: g_inlined_sounds_mutex -> g_audio_graph_mutex -> spatialization_params_mutex.
+//
+// Held across ma_fence_wait() in close() and across the backlog wait() in load_special(). The resource manager's job
+// threads never take this lock, so waiting on them while holding it cannot deadlock. The device callback thread only
+// reaches it through a script data callback that mutates the graph, which stalls audio for as long as the holder runs.
+std::recursive_mutex g_audio_graph_mutex;
 static unordered_map<ma_data_source*, audio_data_source*> g_data_sources_map; // Only allow one audio_data_source wrapper per ma_data_source, should never be populated enough to be a performance hit.
 static std::unique_ptr<sound_service> g_sound_service;
 // These slots are what you use to refer to protocols (which are data sources like archives) and filters (which are transformations like encryption) after they've been plugged into the sound service.
@@ -236,15 +251,20 @@ ma_result wav_seek_proc(ma_encoder *pEncoder, ma_int64 offset, ma_seek_origin or
 unordered_set<sound*> g_inlined_sounds;
 mutex g_inlined_sounds_mutex;
 void garbage_collect_inline_sounds() {
-	auto it = g_inlined_sounds.begin();
-	while (it != g_inlined_sounds.end()) {
-		if ((*it)->get_playing()) ++it;
-		else {
-			unique_lock<mutex> lock(g_inlined_sounds_mutex);
-			(*it)->release();
-			it = g_inlined_sounds.erase(it);
+	vector<sound*> finished;
+	{
+		unique_lock<mutex> lock(g_inlined_sounds_mutex);
+		for (auto it = g_inlined_sounds.begin(); it != g_inlined_sounds.end();) {
+			if ((*it)->get_playing()) ++it;
+			else {
+				finished.push_back(*it);
+				it = g_inlined_sounds.erase(it);
+			}
 		}
 	}
+	// Released with the lock dropped: the last reference destroys the sound, whose destructor closes it and so takes
+	// g_audio_graph_mutex. Holding this lock while waiting on that one is the single ordering that would invert.
+	for (sound *snd : finished) snd->release();
 }
 
 // Sound shapes let mixer/sound::set_position_3d position the sound as though it was more than one tile wide in each direction.
@@ -572,6 +592,7 @@ class audio_data_source_impl : public audio_node_impl, public virtual audio_data
 	audio_data_source* src_next;
 protected:
 	bool set_ma_data_source(ma_data_source* new_src) {
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		reset();
 		if (!new_src) return true;
 		src = make_unique<ma_data_source_node>();
@@ -590,6 +611,7 @@ protected:
 		return true;
 	}
 	void reset() {	
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (src) {
 			auto it = g_data_sources_map.find(src->pDataSource);
 			if (it != g_data_sources_map.end()) g_data_sources_map.erase(it);
@@ -1189,6 +1211,7 @@ protected:
 	audio_node_chain* effects_chain;
 public:
 	mixer_impl(audio_engine *e, bool sound_group = true) : audio_node_impl(nullptr, e), snd(nullptr), shape(nullptr), node_chain(audio_node_chain::create(nullptr, nullptr, e)), effects_chain(nullptr), parent_mixer(nullptr), spatializer(nullptr) {
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		init_sound();
 		node_chain->set_endpoint(e->get_endpoint());
 		if (!sound_group) return;
@@ -1203,6 +1226,7 @@ public:
 	}
 	~mixer_impl() {
 		stop();
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		unique_lock<mutex> lock(spatialization_params_mutex);
 		if (spatializer) {
 			node_chain->remove_node(spatializer);
@@ -1223,8 +1247,13 @@ public:
 	}
 	audio_spatializer* get_spatializer() const {
 		if (!spatializer) {
-			spatializer = audio_spatializer::create(const_cast<mixer_impl*>(this), get_engine());
-			node_chain->add_node(spatializer);
+			// Rechecked under the lock so two threads reaching the lazy creation together produce one spatializer, not two.
+			// The outer check stays unlocked deliberately: this is on the path of every spatialization getter.
+			lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
+			if (!spatializer) {
+				spatializer = audio_spatializer::create(const_cast<mixer_impl*>(this), get_engine());
+				node_chain->add_node(spatializer);
+			}
 		}
 		return spatializer;
 	}
@@ -1233,6 +1262,7 @@ public:
 	bool set_mixer(mixer *mix) override {
 		if (mix == parent_mixer)
 			return false;
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (parent_mixer) {
 			parent_mixer->release();
 			parent_mixer = nullptr;
@@ -1296,8 +1326,11 @@ public:
 	audio_spatializer_reverb3d_placement get_reverb3d_placement() const override { return get_spatializer()->get_reverb3d_placement(); }
 	audio_node_chain* get_effects_chain() override {
 		if (!effects_chain) {
-			effects_chain = audio_node_chain::create(nullptr, nullptr, get_engine());
-			node_chain->add_node(effects_chain);
+			lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
+			if (!effects_chain) {
+				effects_chain = audio_node_chain::create(nullptr, nullptr, get_engine());
+				node_chain->add_node(effects_chain);
+			}
 		}
 		return effects_chain;
 	}
@@ -1636,6 +1669,7 @@ public:
 		}
 	}
 	bool load_special(const std::string &filename, const size_t protocol_slot = 0, directive_t protocol_directive = nullptr, const size_t filter_slot = 0, directive_t filter_directive = nullptr, ma_uint32 ma_flags = MA_SOUND_FLAG_DECODE) override {
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (snd)
 			close();
 		snd = make_unique < ma_sound > ();
@@ -1746,6 +1780,9 @@ public:
 	}
 	bool stream_pcm(const void* data, unsigned int size_in_frames, ma_format format, unsigned int sample_rate, unsigned int channels, unsigned int buffer_size) override {
 		if (format != ma_format_unknown) {
+			// Only the setup below touches the graph. The ring buffer writes past this block are hit continuously by every
+			// caller feeding live PCM, and must not serialize against unrelated sounds loading.
+			lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 			if (snd) close();
 			if (!buffer_size) buffer_size = size_in_frames * 2;
 			if (!buffer_size) return false;
@@ -1804,6 +1841,7 @@ public:
 	}
 	bool open(audio_data_source* ds) override {
 		if (!ds || !ds->get_active()) return false;
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (snd) close();
 		snd = make_unique<ma_sound>();
 		if ((g_soundsystem_last_error = ma_sound_init_from_data_source(get_engine()->get_ma_engine(), ds->get_ma_data_source(), 0, nullptr, &*snd)) != MA_SUCCESS) {
@@ -1818,6 +1856,7 @@ public:
 		return load_completed.test();
 	}
 	bool close() override {
+		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (!snd) return false;
 		// It's possible that this sound could still be loading in a job thread when we try to destroy it. Unfortunately there isn't a way to cancel this, so we have to just wait.
 		if (!load_completed.test()) ma_fence_wait(&fence);

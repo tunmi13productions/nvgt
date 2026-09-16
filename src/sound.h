@@ -14,6 +14,7 @@
 
 #define NOMINMAX
 #include <miniaudio.h>
+#include <mutex>
 #include <reactphysics3d/mathematics/Vector3.h>
 #include "sound_service.h"
 
@@ -40,6 +41,8 @@ enum audio_spatializer_reverb3d_placement {
 
 extern audio_engine *g_audio_engine;
 extern std::atomic<ma_result> g_soundsystem_last_error;
+// Serializes every mutation of the shared node graph. See the definition in sound.cpp for what counts as one and for the lock ordering.
+extern std::recursive_mutex g_audio_graph_mutex;
 // Add support for a new audio format by plugging in a ma_decoding_backend_vtable.
 bool add_decoder(ma_decoding_backend_vtable *vtable);
 bool init_sound();
