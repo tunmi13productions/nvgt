@@ -88,17 +88,14 @@ public:
 	}
 	bool detach_output_bus(unsigned int bus_index) override { set_endpoint(nullptr, 0); return endpoint == nullptr; }
 	bool detach_all_output_buses() override { return detach_output_bus(0); }
-	bool add_node(audio_node* node, audio_node* after, unsigned int input_bus_index) override {
+	// Shared by add_node/add_node_at once each has worked out the real insertion index -- callers
+	// must NOT reuse a null `after` audio_node* to mean "insert at index 0", because that's also
+	// what a caller who simply didn't specify `after` means (append), and the two can't share one
+	// sentinel. See add_node's own comment for the bug this used to be.
+	bool insert_node_at(audio_node* node, unsigned int new_idx, unsigned int input_bus_index) {
 		if (!node) return false;
-		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
-		unsigned int new_idx = 0;
-		if (after) {
-			new_idx = index_of(after);
-			if (new_idx == -1) return false;
-			else new_idx += 1; // Be sure to insert after this position rather than before.
-		}
 		audio_node* prev = new_idx? nodes[new_idx -1] : nullptr;
-		audio_node* next = new_idx? (new_idx < nodes.size()? nodes[new_idx] : endpoint) : (!nodes.empty()? first() : endpoint);
+		audio_node* next = new_idx < nodes.size()? nodes[new_idx] : endpoint;
 		if (prev && !prev->attach_output_bus(0, node, 0)) return false;
 		else if (!prev && !audio_node_impl::attach_output_bus(0, node, 0)) return false;
 		if (next && !node->attach_output_bus(0, next, input_bus_index)) return false;
@@ -106,10 +103,28 @@ public:
 		node->duplicate();
 		return true;
 	}
+	bool add_node(audio_node* node, audio_node* after, unsigned int input_bus_index) override {
+		if (!node) return false;
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
+		// No `after` means "I have no preference, put it wherever" -- which for a chain has to mean
+		// appended at the end, not index 0. Insert-at-front is still reachable, explicitly, through
+		// add_node_at(node, -1); it must not come back through here with the same null sentinel, or
+		// it collapses into the same bug this replaced: every plain add_node(node) call across the
+		// codebase (the plate/convolution low_cut+high_cut chains among them) would keep landing at
+		// the front instead of the back, silently reversing a 3-node chain into the opposite order
+		// and putting the filters before the effect they were meant to shape the output of.
+		unsigned int new_idx = nodes.size();
+		if (after) {
+			int idx = index_of(after);
+			if (idx == -1) return false;
+			new_idx = (unsigned int)idx + 1; // Be sure to insert after this position rather than before.
+		}
+		return insert_node_at(node, new_idx, input_bus_index);
+	}
 	bool add_node_at(audio_node* node, int after, unsigned int input_bus_index) override {
-		if (after < -1 || after >= nodes.size()) return false;
-		audio_node* insert_after = after > -1? nodes[after] : nullptr;
-		return add_node(node, insert_after, input_bus_index);
+		if (after < -1 || after >= (int)nodes.size()) return false;
+		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
+		return insert_node_at(node, after > -1? (unsigned int)(after + 1) : 0, input_bus_index);
 	}
 	bool remove_node(audio_node* node) override {
 		if (!node) return false;
