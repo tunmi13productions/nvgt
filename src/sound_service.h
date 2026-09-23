@@ -146,4 +146,10 @@ public:
 	virtual std::istream *open_uri(const char *uri, const directive_t directive) const;
 	virtual const std::string get_suffix(const directive_t &directive) const;
 	static const protocol *get_instance();
+	/**
+	 * Hands an already connected stream to the next open of this URI instead of connecting again, so the
+	 * connect and the first reads can happen before anything waits on them. Takes ownership; a stream
+	 * nobody opens is deleted with the directive.
+	 */
+	static directive_t directive(std::istream *preopened);
 };

@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <memory>
 #include <Poco/BufferedStreamBuf.h>
 #include <Poco/BufferedBidirectionalStreamBuf.h>
 #include <SDL3/SDL_iostream.h>
@@ -104,9 +105,32 @@ extern std::atomic<std::size_t> g_netstream_buffered; // most recently active ne
 // thread, which keeps two one-second pages, so without a ring the entire cushion is two seconds and
 // any slower moment on the network is an audible gap. A reader thread pulls from the source as fast
 // as it will come, so a consumer waits on the network only once the ring has actually run dry.
+//
+// NOTHING HERE MAY WAIT ON THE NETWORK UNBOUNDED. A server that goes quiet without closing leaves the
+// reader stuck in a socket read for Poco's 60 second timeout, and whoever waits on it inherits that:
+// the decoder's page job, then ma_sound_uninit (which waits for that job), then the main thread that
+// closed the sound. So the ring lives in shared state the reader thread keeps alive by itself, the
+// destructor detaches a blocked reader instead of joining it, a consumer gives up after
+// NETSTREAM_STALL_MS of silence, and abort() lets a sound cut its stream loose before taking the
+// graph lock to close it.
+static const unsigned int NETSTREAM_STALL_MS = 15000;
+struct prebuffer_ring {
+	std::istream* source = nullptr;
+	bool owns_source = false; // deleted with the last reference, which may be the detached reader's
+	std::vector<char> ring;
+	std::size_t head = 0, tail = 0, count = 0;
+	mutable std::mutex mtx;
+	std::condition_variable filled, drained;
+	bool stopping = false, source_done = false;
+	~prebuffer_ring();
+	void abort(); // every wait on this stream returns now, and every later read returns nothing
+	std::size_t buffered() const;
+	// Waits until `bytes` are ringed, the source ends, or the stream is aborted. True if there is
+	// anything to play.
+	bool wait_for(std::size_t bytes, unsigned int timeout_ms);
+};
 class prebuffer_istreambuf : public Poco::BasicBufferedStreamBuf<char, std::char_traits<char>> {
-	static const std::size_t READ_CHUNK = 4096; // also the longest the destructor can wait on a blocked read
-	std::istream* source;
+	static const std::size_t READ_CHUNK = 4096;
 	// Detection window. Holds every byte handed to the consumer until it reaches detect_window, which
 	// is what keeps its contents and the consumer's position describing the same stretch of stream.
 	std::vector<char> window;
@@ -114,20 +138,16 @@ class prebuffer_istreambuf : public Poco::BasicBufferedStreamBuf<char, std::char
 	std::size_t window_pos;
 	bool window_closed;
 	// Read-ahead ring, written by reader_loop and drained by readFromDevice.
-	std::vector<char> ring;
-	std::size_t ring_head, ring_tail, ring_count;
-	mutable std::mutex mtx;
-	std::condition_variable filled, drained;
+	std::shared_ptr<prebuffer_ring> state;
 	std::thread reader;
-	bool stopping, source_done;
-	bool owns_source;
-	void reader_loop();
+	static void reader_loop(std::shared_ptr<prebuffer_ring> state);
 	std::size_t take(char* out, std::size_t n); // out of the ring, waiting only if it is empty
 public:
 	prebuffer_istreambuf(std::istream& source, std::size_t prebuffer_size = 1024);
 	~prebuffer_istreambuf();
 	void own_source(bool owns);
 	std::size_t buffered() const;
+	std::shared_ptr<prebuffer_ring> get_ring() const { return state; }
 	virtual int readFromDevice(char* buffer, std::streamsize length);
 	virtual std::streampos seekoff(std::streamoff off, std::ios_base::seekdir dir, std::ios_base::openmode which = std::ios_base::in);
 	virtual std::streampos seekpos(std::streampos pos, std::ios_base::openmode which = std::ios_base::in);
@@ -137,6 +157,7 @@ public:
 	prebuffer_istream(std::istream& source, std::size_t prebuffer_size = 128 * 1024);
 	~prebuffer_istream();
 	std::istream& own_source(bool owns = true);
+	std::shared_ptr<prebuffer_ring> get_ring() const;
 };
 
 // The base datastream class. This wraps either an iostream or an istream/ostream into a Poco BinaryReader/Writer. This Poco class has functionality extremely similar to Angelscript's scriptfile addon accept that it works on streams, meaning that it can work on much more than files. We also wrap some other basics of std streams.

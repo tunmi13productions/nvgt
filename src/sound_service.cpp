@@ -13,6 +13,8 @@
 
 #include "sound_service.h"
 #include <Poco/URIStreamOpener.h>
+#include <atomic>
+#include <cstdint>
 #include <vector>
 #include <cassert>
 #include <miniaudio.h>
@@ -471,7 +473,17 @@ const sound_service::protocol *pack_protocol::get_instance() {
 }
 
 // internet stream sound service protocol, combining Poco::UriStreamOpener with our prebuffer_istream.
+struct netstream_handoff {
+	mutable std::atomic<std::istream *> stream;
+	netstream_handoff(std::istream *s) : stream(s) {}
+	~netstream_handoff() { delete stream.exchange(nullptr); }
+};
+directive_t netstream_protocol::directive(std::istream *preopened) {
+	return std::make_shared<const netstream_handoff>(preopened);
+}
 std::istream *netstream_protocol::open_uri(const char *uri, const directive_t directive) const {
+	// A handed-off stream can be opened once; a second open (miniaudio's retry after a failed init) gets nothing, because the socket cannot rewind.
+	if (directive) return std::static_pointer_cast<const netstream_handoff>(directive)->stream.exchange(nullptr);
 	try {
 		std::istream *stream = Poco::URIStreamOpener::defaultOpener().open(uri);
 		if (!stream) return nullptr; // Likely invalid URI. Figure out how to provide info about this to user?
@@ -479,6 +491,10 @@ std::istream *netstream_protocol::open_uri(const char *uri, const directive_t di
 	} catch(std::exception&) {} // Again figure out how to let user see exception details.
 	return nullptr;
 }
-const std::string netstream_protocol::get_suffix(const directive_t &directive) const { return "URI"; }
+const std::string netstream_protocol::get_suffix(const directive_t &directive) const {
+	// Unique per handoff, so two sounds streaming the same URL at once never share a triplet and pick up each other's stream.
+	if (directive) return "URI" + std::to_string(reinterpret_cast<std::uintptr_t>(directive.get()));
+	return "URI";
+}
 const netstream_protocol netstream_protocol::instance;
 const sound_service::protocol *netstream_protocol::get_instance() { return &instance; }

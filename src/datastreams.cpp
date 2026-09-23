@@ -13,6 +13,7 @@
  * 3. This notice may not be removed or altered from any source distribution.
  */
 
+#include <chrono>
 #include <exception>
 #include <Poco/Base32Decoder.h>
 #include <Poco/Base32Encoder.h>
@@ -158,71 +159,98 @@ sdl_file_stream::sdl_file_stream(SDL_IOStream* io, std::ios::openmode mode) : st
 std::size_t g_netstream_buffer_size = 512 * 1024;
 std::atomic<std::size_t> g_netstream_buffered{0};
 
-prebuffer_istreambuf::prebuffer_istreambuf(std::istream& source, std::size_t prebuffer_size) : BasicBufferedStreamBuf(4096, std::ios_base::in), source(&source), detect_window(prebuffer_size), window_pos(0), window_closed(false), ring_head(0), ring_tail(0), ring_count(0), stopping(false), source_done(false), owns_source(false) {
-	if (!source.good()) throw std::invalid_argument("Source stream is invalid.");
-	window.reserve(detect_window); // once, so appending never reallocates while audio is being served
-	std::size_t cap = g_netstream_buffer_size;
-	if (cap < READ_CHUNK * 2) cap = READ_CHUNK * 2; // a ring smaller than two reads cannot hold anything useful
-	ring.resize(cap);
-	reader = std::thread(&prebuffer_istreambuf::reader_loop, this);
+prebuffer_ring::~prebuffer_ring() {
+	if (owns_source) delete source;
 }
-prebuffer_istreambuf::~prebuffer_istreambuf() {
+void prebuffer_ring::abort() {
 	{
 		std::lock_guard<std::mutex> lock(mtx);
 		stopping = true;
 	}
 	drained.notify_all();
 	filled.notify_all();
-	// The reader may be inside a blocking source read, which cannot be interrupted; it reads in
-	// READ_CHUNK pieces so that wait is bounded rather than open ended.
-	if (reader.joinable()) reader.join();
-	if (owns_source) delete source;
 }
-void prebuffer_istreambuf::own_source(bool owns) { owns_source = owns; }
-std::size_t prebuffer_istreambuf::buffered() const {
+std::size_t prebuffer_ring::buffered() const {
 	std::lock_guard<std::mutex> lock(mtx);
-	return ring_count;
+	return count;
 }
-void prebuffer_istreambuf::reader_loop() {
+bool prebuffer_ring::wait_for(std::size_t bytes, unsigned int timeout_ms) {
+	std::unique_lock<std::mutex> lock(mtx);
+	if (bytes > ring.size() / 2) bytes = ring.size() / 2; // the reader stops a chunk short of full, so never ask for all of it
+	filled.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this, bytes] { return stopping || source_done || count >= bytes; });
+	return !stopping && count > 0;
+}
+
+prebuffer_istreambuf::prebuffer_istreambuf(std::istream& source, std::size_t prebuffer_size) : BasicBufferedStreamBuf(4096, std::ios_base::in), detect_window(prebuffer_size), window_pos(0), window_closed(false), state(std::make_shared<prebuffer_ring>()) {
+	if (!source.good()) throw std::invalid_argument("Source stream is invalid.");
+	state->source = &source;
+	window.reserve(detect_window); // once, so appending never reallocates while audio is being served
+	std::size_t cap = g_netstream_buffer_size;
+	if (cap < READ_CHUNK * 2) cap = READ_CHUNK * 2; // a ring smaller than two reads cannot hold anything useful
+	state->ring.resize(cap);
+	reader = std::thread(&prebuffer_istreambuf::reader_loop, state);
+}
+prebuffer_istreambuf::~prebuffer_istreambuf() {
+	state->abort();
+	if (!reader.joinable()) return;
+	// A reader blocked in a source read cannot be interrupted, and Poco only gives up on a silent
+	// server after 60 seconds. When it owns the source it also owns the ring, so it can finish that
+	// read and clean up on its own; otherwise the caller is about to delete the source, so wait.
+	if (state->owns_source) reader.detach();
+	else reader.join();
+}
+void prebuffer_istreambuf::own_source(bool owns) { state->owns_source = owns; }
+std::size_t prebuffer_istreambuf::buffered() const { return state->buffered(); }
+void prebuffer_istreambuf::reader_loop(std::shared_ptr<prebuffer_ring> state) {
+	prebuffer_ring& r = *state;
 	std::vector<char> chunk(READ_CHUNK);
 	while (true) {
 		{
-			std::unique_lock<std::mutex> lock(mtx);
-			drained.wait(lock, [this] { return stopping || ring_count + READ_CHUNK <= ring.size(); });
-			if (stopping) return;
+			std::unique_lock<std::mutex> lock(r.mtx);
+			r.drained.wait(lock, [&r] { return r.stopping || r.count + READ_CHUNK <= r.ring.size(); });
+			if (r.stopping) return;
 		}
 		// Outside the lock: this blocks on the network, and holding the lock here would stall the
 		// consumer for exactly as long, which would defeat the whole point of reading ahead.
-		source->read(chunk.data(), READ_CHUNK);
-		std::size_t got = static_cast<std::size_t>(source->gcount());
-		std::lock_guard<std::mutex> lock(mtx);
-		if (stopping) return;
+		r.source->read(chunk.data(), READ_CHUNK);
+		std::size_t got = static_cast<std::size_t>(r.source->gcount());
+		std::lock_guard<std::mutex> lock(r.mtx);
+		if (r.stopping) return;
 		for (std::size_t k = 0; k < got; k++) {
-			ring[ring_head] = chunk[k];
-			ring_head = (ring_head + 1) % ring.size();
+			r.ring[r.head] = chunk[k];
+			r.head = (r.head + 1) % r.ring.size();
 		}
-		ring_count += got;
-		g_netstream_buffered.store(ring_count);
+		r.count += got;
+		g_netstream_buffered.store(r.count);
 		if (got == 0) { // the source is finished, so stop waking up to ask it again
-			source_done = true;
-			filled.notify_all();
+			r.source_done = true;
+			r.filled.notify_all();
 			return;
 		}
-		filled.notify_all();
+		r.filled.notify_all();
 	}
 }
 std::size_t prebuffer_istreambuf::take(char* out, std::size_t n) {
-	std::unique_lock<std::mutex> lock(mtx);
-	filled.wait(lock, [this] { return ring_count > 0 || source_done || stopping; });
-	std::size_t give = std::min(n, ring_count);
-	for (std::size_t k = 0; k < give; k++) {
-		out[k] = ring[ring_tail];
-		ring_tail = (ring_tail + 1) % ring.size();
+	prebuffer_ring& r = *state;
+	std::unique_lock<std::mutex> lock(r.mtx);
+	if (!r.filled.wait_for(lock, std::chrono::milliseconds(NETSTREAM_STALL_MS), [&r] { return r.count > 0 || r.source_done || r.stopping; })) {
+		// The server has gone quiet without closing. Treat it as the end of the stream now rather than
+		// keep the decoder, and anyone closing this sound, waiting out the socket timeout.
+		r.stopping = true;
+		lock.unlock();
+		r.drained.notify_all();
+		return 0;
 	}
-	ring_count -= give;
-	g_netstream_buffered.store(ring_count);
+	if (r.stopping) return 0;
+	std::size_t give = std::min(n, r.count);
+	for (std::size_t k = 0; k < give; k++) {
+		out[k] = r.ring[r.tail];
+		r.tail = (r.tail + 1) % r.ring.size();
+	}
+	r.count -= give;
+	g_netstream_buffered.store(r.count);
 	lock.unlock();
-	drained.notify_all();
+	r.drained.notify_all();
 	return give;
 }
 int prebuffer_istreambuf::readFromDevice(char* buffer, std::streamsize length) {
@@ -280,6 +308,10 @@ std::istream& prebuffer_istream::own_source(bool owns) {
 	prebuffer_istreambuf* buf = static_cast<prebuffer_istreambuf*>(rdbuf());
 	if (buf != nullptr) buf->own_source(owns);
 	return *this;
+}
+std::shared_ptr<prebuffer_ring> prebuffer_istream::get_ring() const {
+	prebuffer_istreambuf* buf = static_cast<prebuffer_istreambuf*>(rdbuf());
+	return buf ? buf->get_ring() : nullptr;
 }
 
 // Global datastream singletons for cin, cout and cerr.

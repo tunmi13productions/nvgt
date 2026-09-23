@@ -18,6 +18,7 @@
 #include <Poco/FileStream.h>
 #include <Poco/Format.h>
 #include <Poco/MemoryStream.h>
+#include <Poco/URIStreamOpener.h>
 #include <reactphysics3d/collision/shapes/AABB.h>
 #include <angelscript.h>
 #include <scriptarray.h>
@@ -1630,6 +1631,10 @@ class sound_impl final : public mixer_impl, public virtual sound {
 	bool paused;
 	bool should_autoclose; // If this is true, the release method defers sound destruction until playback has complete.
 	mutable audio_data_source* datasource; // Avoid the need to keep looking up the pointer to the c++ ma_data_source wrapper associated with this sound.
+	// The live stream stream_url() opened, so close() can cut it loose without the graph lock. See abort_netstream().
+	std::shared_ptr<prebuffer_ring> netstream;
+	std::mutex netstream_mtx;
+	std::atomic<unsigned int> close_count{0}; // lets stream_url() notice a close() that landed while it was connecting
 	inline void postload(const string& filename, bool async_load = false) {
 		loaded_filename = filename;
 		node = (ma_node_base *)&*snd;
@@ -1671,7 +1676,7 @@ public:
 	bool load_special(const std::string &filename, const size_t protocol_slot = 0, directive_t protocol_directive = nullptr, const size_t filter_slot = 0, directive_t filter_directive = nullptr, ma_uint32 ma_flags = MA_SOUND_FLAG_DECODE) override {
 		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (snd)
-			close();
+			close_locked();
 		snd = make_unique < ma_sound > ();
 		// The sound service converts our file name into a "tripplet" which includes information about the origin an asset is expected to come from. This guarantees that we don't mistake assets from different origins as the same just because they have the same name.
 		std::string triplet = g_sound_service->prepare_triplet(filename, protocol_slot, protocol_directive, filter_slot, filter_directive);
@@ -1739,8 +1744,43 @@ public:
 	bool stream(const std::string &filename, const pack_interface* pack_file) override {
 		return load_special(filename, pack_file && pack_file->get_is_active()? g_pack_protocol_slot : sound_service::fs_protocol_slot, pack_file && pack_file->get_is_active()? std::shared_ptr < const pack_interface > (pack_file->make_immutable()) : nullptr, 0, nullptr, MA_SOUND_FLAG_STREAM);
 	}
+	// Connecting and waiting for the server's first bytes happen here, before load_special takes the graph lock. Doing them
+	// inside it meant one silent server froze every other thread that loads or closes any sound, the main thread included.
 	bool stream_url(const std::string &url) override {
-		return load_special(url, g_netstream_protocol_slot, nullptr, 0, nullptr, MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_UNKNOWN_LENGTH);
+		close();
+		unsigned int generation = close_count.load();
+		std::istream *source = nullptr;
+		try {
+			source = Poco::URIStreamOpener::defaultOpener().open(url);
+		} catch (std::exception &e) {
+			NVGT_ERROR("nvgt.sound", Poco::format("could not connect to %s: %s", url, string(e.what())));
+		}
+		if (!source) return false;
+		prebuffer_istream *stream = nullptr;
+		try {
+			stream = new prebuffer_istream(*source);
+		} catch (std::exception &) {
+			delete source;
+			return false;
+		}
+		stream->own_source();
+		std::shared_ptr<prebuffer_ring> ring = stream->get_ring();
+		{
+			lock_guard<mutex> lock(netstream_mtx);
+			netstream = ring;
+		}
+		// Any data at all means the server is talking; then give format detection a head start so init rarely waits on the network.
+		bool ready = ring->wait_for(1, NETSTREAM_STALL_MS) && ring->wait_for(32 * 1024, 3000);
+		if (!ready || close_count.load() != generation) {
+			if (!ready) NVGT_ERROR("nvgt.sound", Poco::format("could not stream %s: the server sent nothing", url));
+			{
+				lock_guard<mutex> lock(netstream_mtx);
+				if (netstream == ring) netstream.reset();
+			}
+			delete stream;
+			return false;
+		}
+		return load_special(url, g_netstream_protocol_slot, netstream_protocol::directive(stream), 0, nullptr, MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_UNKNOWN_LENGTH);
 	}
 	bool load_string(const std::string &data) override { return load_memory(data.data(), data.size()); }
 	bool load_string_async(const std::string &data) override {
@@ -1855,7 +1895,23 @@ public:
 	bool is_load_completed() const override {
 		return load_completed.test();
 	}
+	// Wakes anything waiting on this sound's live stream: the decoder's page job, which ma_sound_uninit waits for, or a
+	// stream_url() still connecting on another thread. Deliberately outside the graph lock, since whoever holds that lock
+	// may be the one waiting.
+	void abort_netstream() {
+		std::shared_ptr<prebuffer_ring> ring;
+		{
+			lock_guard<mutex> lock(netstream_mtx);
+			ring = std::move(netstream);
+		}
+		if (ring) ring->abort();
+	}
 	bool close() override {
+		abort_netstream();
+		close_count++;
+		return close_locked();
+	}
+	bool close_locked() {
 		lock_guard<recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (!snd) return false;
 		// It's possible that this sound could still be loading in a job thread when we try to destroy it. Unfortunately there isn't a way to cancel this, so we have to just wait.
