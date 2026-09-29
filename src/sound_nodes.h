@@ -237,7 +237,14 @@ class plate_reverb_node : public virtual audio_node {
 class convolution_reverb_node : public virtual audio_node {
 	public:
 	virtual bool load_ir(const std::string& filename, const pack_interface* pack_file = nullptr) = 0;
+	virtual bool load_ir_async(const std::string& filename, const pack_interface* pack_file = nullptr) = 0;
+	virtual bool get_ir_loading() const = 0;
+	virtual bool get_ir_load_failed() const = 0;
 	virtual void clear_ir() = 0;
+	virtual void set_max_ir_seconds(float seconds) = 0;
+	virtual float get_max_ir_seconds() const = 0;
+	virtual void set_ir_rate_divisor(unsigned int divisor) = 0;
+	virtual unsigned int get_ir_rate_divisor() const = 0;
 	virtual bool get_ir_loaded() const = 0;
 	virtual unsigned long long get_ir_length_frames() const = 0;
 	virtual float get_ir_length_ms() const = 0;
@@ -245,7 +252,7 @@ class convolution_reverb_node : public virtual audio_node {
 	virtual float get_wet() const = 0;
 	virtual void set_dry(float dry) = 0;
 	virtual float get_dry() const = 0;
-	static convolution_reverb_node* create(audio_engine* engine, unsigned int partition_size = 1024);
+	static convolution_reverb_node* create(audio_engine* engine, unsigned int partition_size = 512);
 };
 class reverb3d : public virtual passthrough_node {
 public:

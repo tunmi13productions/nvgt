@@ -11,8 +11,12 @@
  * 3. This notice may not be removed or altered from any source distribution.
 */
 
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <Poco/NotificationQueue.h>
 #include <Poco/Thread.h>
@@ -565,59 +569,142 @@ class plate_reverb_node_impl : public audio_node_impl, public virtual plate_reve
 };
 plate_reverb_node* plate_reverb_node::create(audio_engine* e) { return new plate_reverb_node_impl(e); }
 
+// Only one impulse response is decoded and transformed at a time however many nodes ask at once, so a burst of background loads is a queue rather than a spike across every core.
+static std::mutex g_convolution_prepare_mutex;
+// What a convolution node shares with its background loads. A load's worker thread is never joined: a node can be destroyed while the main thread holds g_audio_graph_mutex (a mixer tears its effects chain down under it), and the worker's decoder needs that same mutex, so joining there would deadlock. Instead the worker keeps this alive on its own, and only touches the node under `m`, which the destructor takes to clear `node`. Nothing done under `m` needs the graph mutex.
+struct convolution_load_shared {
+	enum { LOAD_NONE, LOAD_BUSY, LOAD_DONE, LOAD_FAILED };
+	std::mutex m;
+	ma_convolution_node* node = nullptr; // Null once the owning node is gone.
+	std::atomic<unsigned int> generation{0}; // Bumped by every load, clear and the destructor. A worker whose generation is stale has been cancelled.
+	std::atomic<int> load_state{LOAD_NONE};
+	std::atomic<bool> ir_loaded{false};
+	std::atomic<unsigned long long> ir_length_frames{0};
+};
+// Decoding goes through audio_decoder rather than a dedicated loader so the impulse response gets every format, pack file and resampling support the rest of the sound system already has, arriving pre-matched to the engine's sample rate and channel count. Then transformed and swapped into the node, unless generation `gen` has been superseded. Returns rather than stores the result because g_soundsystem_last_error is not safe to write from a worker.
+static ma_result convolution_decode_and_set(audio_engine* engine, const std::shared_ptr<convolution_load_shared>& shared, unsigned int gen, const std::string& filename, const pack_interface* pack_file, float seconds, unsigned int divisor) {
+	audio_decoder* dec = audio_decoder::create(engine);
+	if (!dec) return MA_OUT_OF_MEMORY;
+	if (!dec->open(filename, pack_file, engine->get_sample_rate(), engine->get_channels())) {
+		dec->release();
+		return MA_DOES_NOT_EXIST;
+	}
+	unsigned long long total = dec->get_length_frames();
+	unsigned int channels = dec->get_channels();
+	if (total == 0 || channels == 0) {
+		dec->release();
+		return MA_INVALID_FILE;
+	}
+	// Everything past the cut is thrown away, so it is never decoded. The extra frame is what tells set_ir_ex the response was cut, so it fades the end instead of stopping dead.
+	if (seconds > 0) {
+		unsigned long long cap = (unsigned long long)(engine->get_sample_rate() * (double)seconds) + 1;
+		if (total > cap) total = cap;
+	}
+	vector<float> buffer(total * channels);
+	unsigned long long read_so_far = 0;
+	while (read_so_far < total) {
+		if (shared->generation != gen) {
+			dec->release();
+			return MA_CANCELLED;
+		}
+		unsigned long long want = total - read_so_far;
+		if (want > 16384) want = 16384;
+		unsigned long long n = dec->read(buffer.data() + read_so_far * channels, want);
+		if (n == 0) break;
+		read_so_far += n;
+	}
+	dec->release();
+	if (read_so_far == 0) return MA_INVALID_FILE;
+	std::lock_guard<std::mutex> lock(shared->m);
+	if (!shared->node || shared->generation != gen) return MA_CANCELLED;
+	ma_result r = ma_convolution_node_set_ir_ex(shared->node, buffer.data(), read_so_far, channels, seconds, divisor, nullptr);
+	if (r != MA_SUCCESS) return r;
+	shared->ir_length_frames = ma_convolution_node_get_ir_length_in_frames(shared->node);
+	shared->ir_loaded = true;
+	return MA_SUCCESS;
+}
 class convolution_reverb_node_impl : public audio_node_impl, public virtual convolution_reverb_node {
 	unique_ptr<ma_convolution_node> cn;
-	unsigned long long ir_length_frames;
-	bool ir_loaded;
+	std::shared_ptr<convolution_load_shared> shared;
+	std::atomic<float> max_ir_seconds;
+	std::atomic<unsigned int> ir_rate_divisor;
 	public:
-	convolution_reverb_node_impl(audio_engine* e, unsigned int partition_size) : cn(make_unique<ma_convolution_node>()), audio_node_impl(nullptr, e), ir_length_frames(0), ir_loaded(false) {
+	convolution_reverb_node_impl(audio_engine* e, unsigned int partition_size) : cn(make_unique<ma_convolution_node>()), audio_node_impl(nullptr, e), shared(std::make_shared<convolution_load_shared>()), max_ir_seconds(0.0f), ir_rate_divisor(1) {
 		ma_convolution_node_config cfg = ma_convolution_node_config_init(e->get_channels(), e->get_sample_rate());
 		if (partition_size) cfg.partitionSize = partition_size;
 		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if ((g_soundsystem_last_error = ma_convolution_node_init(ma_engine_get_node_graph(e->get_ma_engine()), &cfg, nullptr, &*cn)) != MA_SUCCESS) throw std::runtime_error("ma_convolution_node was not initialized");
 		node = (ma_node_base*)&*cn;
+		shared->node = &*cn;
 	}
 	~convolution_reverb_node_impl() {
+		// Waits at most for a swap already in progress, which never needs the graph mutex. See convolution_load_shared.
+		shared->generation++;
+		{
+			std::lock_guard<std::mutex> lock(shared->m);
+			shared->node = nullptr;
+		}
 		std::lock_guard<std::recursive_mutex> graph_lock(g_audio_graph_mutex);
 		if (cn) ma_convolution_node_uninit(&*cn, nullptr);
 	}
-	// Decoding goes through audio_decoder rather than a dedicated loader so the impulse response gets every format, pack file and resampling support the rest of the sound system already has, arriving pre-matched to the engine's sample rate and channel count.
 	bool load_ir(const std::string& filename, const pack_interface* pack_file) override {
 		if (!cn) return false;
-		audio_decoder* dec = audio_decoder::create(engine);
-		if (!dec) return false;
-		if (!dec->open(filename, pack_file, engine->get_sample_rate(), engine->get_channels())) {
-			dec->release();
+		unsigned int gen = ++shared->generation; // Also cancels any background load.
+		ma_result r = convolution_decode_and_set(engine, shared, gen, filename, pack_file, max_ir_seconds, ir_rate_divisor);
+		g_soundsystem_last_error = r;
+		shared->load_state = r == MA_SUCCESS ? convolution_load_shared::LOAD_DONE : convolution_load_shared::LOAD_FAILED;
+		return r == MA_SUCCESS;
+	}
+	// The same load on a worker thread. Whatever response is already loaded keeps playing until the new one is ready, then the two are swapped in one step. Starting another load, or clearing, cancels one still in flight.
+	bool load_ir_async(const std::string& filename, const pack_interface* pack_file) override {
+		if (!cn) return false;
+		unsigned int gen = ++shared->generation;
+		shared->load_state = convolution_load_shared::LOAD_BUSY;
+		if (pack_file) pack_file->duplicate();
+		std::shared_ptr<convolution_load_shared> s = shared;
+		audio_engine* e = engine;
+		float seconds = max_ir_seconds;
+		unsigned int divisor = ir_rate_divisor;
+		try {
+			std::thread([s, e, gen, filename, pack_file, seconds, divisor]() {
+				ma_result r = MA_CANCELLED;
+				bool slot = false;
+				while (s->generation == gen && !(slot = g_convolution_prepare_mutex.try_lock()))
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				if (slot) {
+					r = convolution_decode_and_set(e, s, gen, filename, pack_file, seconds, divisor);
+					g_convolution_prepare_mutex.unlock();
+				}
+				if (pack_file) pack_file->release();
+				// A superseded load leaves the state to whatever superseded it.
+				std::lock_guard<std::mutex> lock(s->m);
+				if (s->generation == gen) s->load_state = r == MA_SUCCESS ? convolution_load_shared::LOAD_DONE : convolution_load_shared::LOAD_FAILED;
+			}).detach();
+		} catch (...) {
+			if (pack_file) pack_file->release();
+			shared->load_state = convolution_load_shared::LOAD_FAILED;
 			return false;
 		}
-		unsigned long long total = dec->get_length_frames();
-		unsigned int channels = dec->get_channels();
-		if (total == 0 || channels == 0) {
-			dec->release();
-			return false;
-		}
-		vector<float> buffer(total * channels);
-		unsigned long long read_so_far = 0;
-		while (read_so_far < total) {
-			unsigned long long n = dec->read(buffer.data() + read_so_far * channels, total - read_so_far);
-			if (n == 0) break;
-			read_so_far += n;
-		}
-		dec->release();
-		if (read_so_far == 0) return false;
-		if ((g_soundsystem_last_error = ma_convolution_node_set_ir(&*cn, buffer.data(), read_so_far, channels, nullptr)) != MA_SUCCESS) return false;
-		ir_length_frames = read_so_far;
-		ir_loaded = true;
 		return true;
 	}
+	bool get_ir_loading() const override { return shared->load_state == convolution_load_shared::LOAD_BUSY; }
+	bool get_ir_load_failed() const override { return shared->load_state == convolution_load_shared::LOAD_FAILED; }
 	void clear_ir() override {
+		shared->generation++;
+		std::lock_guard<std::mutex> lock(shared->m);
 		if (cn) ma_convolution_node_clear_ir(&*cn, nullptr);
-		ir_loaded = false;
-		ir_length_frames = 0;
+		shared->ir_loaded = false;
+		shared->ir_length_frames = 0;
+		shared->load_state = convolution_load_shared::LOAD_NONE;
 	}
-	bool get_ir_loaded() const override { return ir_loaded; }
-	unsigned long long get_ir_length_frames() const override { return ir_length_frames; }
-	float get_ir_length_ms() const override { return engine->get_sample_rate() > 0? (float)ir_length_frames / engine->get_sample_rate() * 1000.0f : 0.0f; }
+	void set_max_ir_seconds(float seconds) override { max_ir_seconds = seconds < 0 ? 0 : seconds; }
+	float get_max_ir_seconds() const override { return max_ir_seconds; }
+	// The node needs a power of two that still leaves a usable block, so anything else is rounded down to one.
+	void set_ir_rate_divisor(unsigned int divisor) override { ir_rate_divisor = divisor >= 8 ? 8 : divisor >= 4 ? 4 : divisor >= 2 ? 2 : 1; }
+	unsigned int get_ir_rate_divisor() const override { return ir_rate_divisor; }
+	bool get_ir_loaded() const override { return shared->ir_loaded; }
+	unsigned long long get_ir_length_frames() const override { return shared->ir_length_frames; }
+	float get_ir_length_ms() const override { return engine->get_sample_rate() > 0? (float)shared->ir_length_frames / engine->get_sample_rate() * 1000.0f : 0.0f; }
 	void set_wet(float wet) override { if (cn) ma_convolution_node_set_wet(&*cn, wet); }
 	float get_wet() const override { return cn? ma_convolution_node_get_wet(&*cn) : 0.0f; }
 	void set_dry(float dry) override { if (cn) ma_convolution_node_set_dry(&*cn, dry); }
