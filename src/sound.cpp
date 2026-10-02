@@ -892,7 +892,7 @@ class audio_decoder_impl : public audio_data_source_impl, public virtual audio_d
 		return cfg;
 	}
 public:
-	audio_decoder_impl(audio_engine* e) : audio_data_source_impl(nullptr, e), decoder(nullptr), datastream_ref(nullptr) {}
+	audio_decoder_impl(audio_engine* e) : audio_data_source_impl(e, nullptr), decoder(nullptr), datastream_ref(nullptr) {}
 	~audio_decoder_impl() { close(); }
 	virtual bool open(const std::string& filename, const pack_interface* pack_file, unsigned int sample_rate, unsigned int channels) override {
 		if (decoder && !close()) return false;
