@@ -52,6 +52,7 @@
 #include "random_interface.h"    // cleanup_default_random()
 #include "serialize.h" // current location of g_StringTypeid (subject to change)
 #include "sound.h"
+#include "nvsound.h"
 #include "tts.h"
 #include "UI.h" // message
 #include "version.h"
@@ -373,6 +374,8 @@ protected:
 		timeEndPeriod(1);
 		#endif
 		screen_reader_unload();
+		// Before InputDestroy, which calls SDL_Quit and frees every SDL audio stream out from under the sound engine.
+		nvsound::shutdown();
 		InputDestroy();
 		uninit_sound();
 		anticheat_deinit();

@@ -69,6 +69,7 @@
 #include "scriptstuff.h"
 #include "serialize.h"
 #include "sound.h"
+#include "nvsound.h"
 #include "system_fingerprint.h"
 #include "threading.h"
 #include "timestuff.h"
@@ -523,6 +524,13 @@ int ConfigureEngine(asIScriptEngine *engine) {
 	engine->BeginConfigGroup("sound");
 	system_namespace("sound");
 	RegisterSoundsystem(engine);
+	system_namespace();
+	engine->EndConfigGroup();
+	// The new SDL3 + Steam Audio engine lives in the steam namespace while it is being built alongside the MiniAudio one, which it will replace.
+	engine->BeginConfigGroup("nvsound");
+	engine->SetDefaultNamespace("steam");
+	nvsound::RegisterNvsound(engine);
+	nvsound::RegisterNvsoundMicrophone(engine);
 	system_namespace();
 	engine->EndConfigGroup();
 	engine->BeginConfigGroup("tonesynth");

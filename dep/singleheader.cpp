@@ -27,6 +27,12 @@
 #include "bl_number_to_words.h"
 #define DBGTOOLS_IMPLEMENTATION
 #include "dbgtools.h"
+#define DR_FLAC_IMPLEMENTATION
+#include "dr_flac.h"
+#define DR_MP3_IMPLEMENTATION
+#include "dr_mp3.h"
+#define DR_WAV_IMPLEMENTATION
+#include "dr_wav.h"
 #define MINIAUDIO_IMPLEMENTATION
 #include <miniaudio.h>
 #define RND_IMPLEMENTATION
