@@ -331,3 +331,100 @@ void test_steam_sound_effects_in_the_mix() {
 	assert(!s.playing, "a sound with effects never finished");
 	assert(m.set_fx(""));
 }
+
+// Phase 3: Steam Audio. HRTF placement is checked numerically outside the engine; this checks it runs in the mix.
+void test_steam_sound_hrtf_plays() {
+	if (!steam::SOUND_AVAILABLE) return;
+	steam::sound_global_hrtf = true;
+	assert(steam::sound_global_hrtf);
+	steam::mixer m;
+	m.volume = -100;
+	steam::sound s;
+	assert(s.set_mixer(m));
+	assert(s.load("data/audio/yfs.wav"));
+	s.set_hrtf(true);
+	assert(s.set_position(0, 0, 0, 5, 3, 0));
+	assert(s.play());
+	timer t;
+	for (int i = 0; s.playing && t.elapsed < 4000; i++) {
+		s.set_position(0, 0, 0, cos(i * 0.1) * 5, sin(i * 0.1) * 5, 0, i * 0.05); // Moving and turning while it plays.
+		wait(10);
+	}
+	assert(!s.playing, "an HRTF sound never finished");
+	steam::mixer positioned; // Mixers can be placed too.
+	assert(positioned.set_mixer(m));
+	positioned.set_hrtf(true);
+	assert(positioned.set_position(0, 0, 0, -4, 0, 0));
+	assert(s.set_mixer(positioned));
+	s.pitch = 150; // A pitched sound under an HRTF mixer.
+	assert(s.play());
+	t.restart();
+	while (s.playing && t.elapsed < 4000) wait(10);
+	assert(!s.playing);
+}
+
+// sound_environment. Occlusion, transmission and reflections are checked numerically against real Steam Audio scenes outside the engine; this checks the script side.
+void test_steam_sound_environment() {
+	steam::sound_environment env;
+	assert(steam::sound_global_hrtf); // Turned on by creating an environment, as in the legacy engine.
+	assert(env.add_material("felt", 0.5, 0.6, 0.7, 0.05, 0.3, 0.2, 0.1));
+	assert(!env.add_material("felt", 0, 0, 0, 0, 0, 0, 0)); // Already there.
+	assert(env.add_material("felt", 0, 0, 0, 0, 0, 0, 0, true)); // Unless asked to replace it.
+	assert(env.add_box("concrete", -10, 10, -10, 10, -1, 0)); // A floor.
+	assert(!env.add_box("unobtainium", 0, 1, 0, 1, 0, 1));
+	env.set_listener(0, 0, 0, 0);
+	steam::sound@ s = env.new_sound();
+	assert(s !is null);
+	steam::mixer@ m = env.new_mixer();
+	assert(m !is null);
+	if (!steam::SOUND_AVAILABLE) return;
+	steam::mixer quiet;
+	quiet.volume = -100;
+	assert(s.set_mixer(quiet));
+	assert(s.load("data/audio/yfs.wav"));
+	assert(s.set_position(0, 0, 0, 4, 2, 0));
+	assert(s.play());
+	timer t;
+	for (int i = 0; s.playing && t.elapsed < 4000; i++) {
+		env.set_listener(0, i * 0.01, 0, 0);
+		env.update();
+		wait(10);
+	}
+	assert(!s.playing, "a sound in an environment never finished");
+	@s = null; // Releasing sounds detaches them from the environment.
+	@m = null;
+}
+
+// set_impulse_response. The convolver is checked against direct convolution outside the engine; this checks the script side. hall_ir.wav is a synthesized 1.2 second stereo response.
+void test_steam_sound_impulse_response() {
+	steam::mixer m;
+	assert(m.set_impulse_response("data/audio/hall_ir.wav"));
+	assert(m.set_impulse_response("data/audio/hall_ir.wav", 1.0, 0.5, "data/audio/yfs.wav", 0.5)); // A second file makes it true stereo.
+	// A real recorded response, 24 bit at 44.1 kHz so it is resampled on load. It isn't in the repository, so this only runs where it has been copied in.
+	if (file_exists("data/audio/sedan_speakers_front.wav")) assert(m.set_impulse_response("data/audio/sedan_speakers_front.wav", 0.0, 0.3));
+	assert(!m.set_impulse_response("data/audio/no_such_response.wav"));
+	assert(!m.set_impulse_response("data/audio/hall_ir.wav", 1, 0.3, "data/audio/no_such_right.wav"));
+	assert(m.set_impulse_response_params(0.8, 0.4, 0.0)); // Centred tail.
+	steam::set_impulse_response_quality(0.5, 2); // Cheaper responses from here on.
+	assert(m.set_impulse_response("data/audio/hall_ir.wav"));
+	steam::set_impulse_response_quality(1.5, 3); // 3 isn't a power of two, so loading refuses it.
+	assert(!m.set_impulse_response("data/audio/hall_ir.wav"));
+	steam::set_impulse_response_quality();
+	assert(m.set_impulse_response("data/audio/hall_ir.wav"));
+	if (steam::SOUND_AVAILABLE) {
+		steam::mixer quiet;
+		quiet.volume = -100;
+		assert(m.set_mixer(quiet));
+		steam::sound s;
+		assert(s.set_mixer(m));
+		assert(s.load("data/audio/yfs.ogg"));
+		assert(s.play());
+		timer t;
+		while (s.playing && t.elapsed < 4000) {
+			m.set_impulse_response_params(1, 0.2 + t.elapsed / 10000.0, 1); // Eased every frame, as games do with distance.
+			wait(10);
+		}
+		assert(!s.playing);
+	}
+	assert(m.set_impulse_response("")); // Off.
+}

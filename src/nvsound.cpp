@@ -12,7 +12,9 @@
 */
 
 #include "nvsound.h"
+#include "nvsound_convolver.h"
 #include "nvsound_effects.h"
+#include "nvsound_phonon.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -179,7 +181,7 @@ std::vector<std::string> get_input_device_names() {
 }
 
 // sound_base
-sound_base::~sound_base() {}
+sound_base::~sound_base() { release_phonon_state(phonon); }
 void sound_base::add_ref() { ref_count++; }
 void sound_base::release() {
 	if (--ref_count == 0) delete this;
@@ -264,34 +266,76 @@ bool sound_base::is_pitch_sliding() {
 }
 bool sound_base::is_sliding() { return is_volume_sliding() || is_pan_sliding() || is_pitch_sliding(); }
 bool sound_base::set_position(float lx, float ly, float lz, float sx, float sy, float sz, float rot, float pstep, float vstep) {
-	std::lock_guard<spinlock> l(params_lock);
-	listener_x = lx;
-	listener_y = ly;
-	listener_z = lz;
-	x = sx;
-	y = sy;
-	z = sz;
-	rotation = rot;
-	pan_step = pstep;
-	volume_step = vstep;
-	positioned = lx != sx || ly != sy || lz != sz;
+	{
+		std::lock_guard<spinlock> l(params_lock);
+		listener_x = lx;
+		listener_y = ly;
+		listener_z = lz;
+		x = sx;
+		y = sy;
+		z = sz;
+		rotation = rot;
+		pan_step = pstep;
+		volume_step = vstep;
+		positioned = lx != sx || ly != sy || lz != sz;
+	}
+	ensure_phonon(); // Outside params_lock, since it can wait on the graph mutex, which the audio thread holds while it takes params_lock.
+	phonon_set_position(phonon, sx, sy, sz);
 	return true;
 }
-// The legacy engine's positioning without HRTF: lose a decibel per unit of distance scaled by volume_step, pan by the x offset scaled by pan_step. Must be called with params_lock held.
-void sound_base::positioning(float& vol_db, float& pan_value) {
+bool sound_base::attach_environment(sound_environment* env) {
+	if (!phonon) {
+		phonon_state* s = create_phonon_state();
+		if (!s) return false;
+		std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+		if (phonon) release_phonon_state(s);
+		else phonon = s;
+	}
+	float px, py, pz;
+	{
+		std::lock_guard<spinlock> l(params_lock);
+		px = x;
+		py = y;
+		pz = z;
+	}
+	return phonon_attach_environment(phonon, env, px, py, pz);
+}
+void sound_base::set_hrtf(bool enable) {
+	use_hrtf = enable;
+	ensure_phonon();
+}
+// Builds this node's Steam Audio effects the first time a positioned sound needs HRTF. Done here on the script's thread because the audio thread shouldn't allocate.
+void sound_base::ensure_phonon() {
+	if (phonon || !positioned || !use_hrtf || !g_global_hrtf) return;
+	phonon_state* s = create_phonon_state();
+	if (!s) return;
+	std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+	if (phonon) release_phonon_state(s);
+	else phonon = s;
+}
+spatial_params sound_base::snapshot_position(bool& is_positioned) {
+	is_positioned = positioned;
+	return spatial_params{listener_x, listener_y, listener_z, x, y, z, rotation, pan_step, volume_step};
+}
+// With HRTF, Steam Audio places the sound and only distance changes the volume. Without it, the legacy engine's positioning: lose a decibel per unit of distance scaled by volume_step, pan by the x offset scaled by pan_step.
+void sound_base::spatialize(float* frames, int count, const spatial_params& p, bool is_positioned, float& vol_db, float& pan_value) {
 	vol_db = 0;
 	pan_value = 0;
-	if (!positioned) return;
-	float dx = x - listener_x, dy = y - listener_y, dz = z - listener_z;
-	if (rotation > 0) {
-		float rx = cosf(rotation) * dx - sinf(rotation) * dy;
-		float ry = sinf(rotation) * dx + cosf(rotation) * dy;
+	if (phonon && use_hrtf && g_global_hrtf) {
+		phonon_spatialize(phonon, frames, count, p, vol_db);
+		return;
+	}
+	if (!is_positioned) return;
+	float dx = p.x - p.listener_x, dy = p.y - p.listener_y, dz = p.z - p.listener_z;
+	if (p.rotation > 0) {
+		float rx = cosf(p.rotation) * dx - sinf(p.rotation) * dy;
+		float ry = sinf(p.rotation) * dx + cosf(p.rotation) * dy;
 		dx = rx;
 		dy = ry;
 	}
-	float v = 1.0f - floorf(sqrtf(dx * dx + dy * dy + dz * dz)) / (125.0f / volume_step);
+	float v = 1.0f - floorf(sqrtf(dx * dx + dy * dy + dz * dz)) / (125.0f / p.volume_step);
 	vol_db = std::clamp(v, 0.0f, 1.0f) * 100.0f - 100.0f;
-	pan_value = std::clamp(dx / (125.0f / pan_step), -1.0f, 1.0f) * 100.0f;
+	pan_value = std::clamp(dx / (125.0f / p.pan_step), -1.0f, 1.0f) * 100.0f;
 }
 // Mixes stereo input into the output with the given volume and pans, ramping from the previous block's gains so that changes don't click.
 // The script's pan and the positioning pan were applied by separate stages under BASS, so their attenuations multiply rather than cancel.
@@ -345,12 +389,14 @@ void mixer::render(float* out, int frames, int depth) {
 	if (depth > 64) return; // A cycle can't be built through set_mixer, but never recurse forever.
 	uint64_t now = g_frame_clock;
 	float vol, pn, pt, pos_vol, pos_pan;
+	bool is_positioned;
+	spatial_params sp;
 	{
 		std::lock_guard<spinlock> l(params_lock);
 		vol = volume.at(now);
 		pn = pan.at(now);
 		pt = pitch.at(now);
-		positioning(pos_vol, pos_pan);
+		sp = snapshot_position(is_positioned);
 	}
 	float* acc = scratch(0, depth, size_t(frames) * 2);
 	if (!resampler) {
@@ -367,6 +413,8 @@ void mixer::render(float* out, int frames, int depth) {
 		if (got < frames) memset(acc + got * 2, 0, (frames - got) * 2 * sizeof(float));
 	}
 	process_fx(acc, frames);
+	process_ir(acc, frames, depth);
+	spatialize(acc, frames, sp, is_positioned, pos_vol, pos_pan);
 	apply_gain(acc, out, frames, vol + pos_vol, pn, pos_pan);
 }
 
@@ -456,6 +504,78 @@ static std::shared_ptr<const pcm_data> decode_all(decoder& dec) {
 	}
 	pcm->sample_rate = g_sample_rate;
 	return pcm;
+}
+
+// set_impulse_response. Responses loaded from now on are cut to tail_seconds (0 keeps them whole) and convolved at the sample rate divided by rate_divisor, trading quality for work. 1.5 seconds and full rate are the defaults hide and seek's engine used.
+static std::atomic<float> g_ir_tail_seconds{1.5f};
+static std::atomic<int> g_ir_rate_divisor{1};
+void set_impulse_response_quality(float tail_seconds, int rate_divisor) {
+	g_ir_tail_seconds = std::max(tail_seconds, 0.0f);
+	g_ir_rate_divisor = std::max(rate_divisor, 1);
+}
+// Decodes a whole file, through the default pack like sound.load, at the engine's sample rate.
+static std::shared_ptr<const pcm_data> decode_file(const std::string& filename) {
+	std::string key = prepare_file(filename, g_default_pack.get());
+	if (key.empty()) return nullptr;
+	std::unique_ptr<std::istream> in = open_file(key);
+	std::unique_ptr<decoder> dec = in ? open_decoder(std::move(in)) : nullptr;
+	return dec ? decode_all(*dec) : nullptr;
+}
+bool sound_base::set_impulse_response(const std::string& response, float dry, float wet, const std::string& response_right, float spread) {
+	if (!init()) return false;
+	if (response.empty()) {
+		ir_enabled = false;
+		if (ir) ir->clear_ir();
+		return true;
+	}
+	std::shared_ptr<const pcm_data> left = decode_file(response);
+	if (!left || left->frames == 0) return false;
+	std::vector<float> stereo;
+	const float* frames = left->samples.data();
+	uint64_t count = left->frames;
+	unsigned int channels = left->channels;
+	if (!response_right.empty()) {
+		// Two responses make one true stereo response: the first file's first channel on the left, the second's on the right.
+		std::shared_ptr<const pcm_data> right = decode_file(response_right);
+		if (!right || right->frames == 0) return false;
+		count = std::max(left->frames, right->frames);
+		stereo.assign(size_t(count) * 2, 0.0f);
+		for (uint64_t f = 0; f < left->frames; f++) stereo[f * 2] = left->samples[f * left->channels];
+		for (uint64_t f = 0; f < right->frames; f++) stereo[f * 2 + 1] = right->samples[f * right->channels];
+		frames = stereo.data();
+		channels = 2;
+	}
+	if (!ir) {
+		std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+		ir = std::make_unique<convolver>(2, g_sample_rate);
+	}
+	if (!ir->set_ir(frames, count, channels, g_ir_tail_seconds, unsigned(g_ir_rate_divisor))) return false;
+	set_impulse_response_params(dry, wet, spread);
+	ir_enabled = true;
+	return true;
+}
+// Cheap enough to call every frame, as a game easing the reverb with distance does: nothing is reloaded.
+bool sound_base::set_impulse_response_params(float dry, float wet, float spread) {
+	ir_dry = std::max(dry, 0.0f);
+	ir_wet = std::max(wet, 0.0f);
+	ir_spread = std::clamp(spread, 0.0f, 1.0f);
+	return true;
+}
+// Spread narrows what feeds the convolver toward mono: at 1 each channel is convolved with its own input, so the wet follows the source's pan; at 0 both get the mono sum, so the wet's stereo comes from the response alone and stays centred.
+void sound_base::process_ir(float* frames, int count, int depth) {
+	if (!ir_enabled || !ir) return;
+	float spread = ir_spread;
+	const float* conv_in = frames;
+	if (spread < 1.0f) {
+		float* narrowed = scratch(1, depth, size_t(count) * 2);
+		for (int f = 0; f < count; f++) {
+			float l = frames[f * 2], r = frames[f * 2 + 1], mono = (l + r) * 0.5f;
+			narrowed[f * 2] = mono + spread * (l - mono);
+			narrowed[f * 2 + 1] = mono + spread * (r - mono);
+		}
+		conv_in = narrowed;
+	}
+	ir->process(conv_in, frames, frames, unsigned(count), ir_dry, ir_wet);
 }
 
 // sound
@@ -732,6 +852,7 @@ bool sound::play_looped() {
 bool sound::pause() {
 	if (!src || !playing) return false;
 	playing = false;
+	reset_phonon_state(phonon);
 	return true;
 }
 bool sound::stop() {
@@ -739,12 +860,14 @@ bool sound::stop() {
 	playing = false;
 	src->seek(0);
 	ended = false;
+	reset_phonon_state(phonon);
 	return true;
 }
 bool sound::seek(float ms) {
 	if (!src || ms < 0) return false;
 	if (!src->seek(uint64_t(double(ms) / 1000.0 * src->sample_rate()))) return false;
 	ended = false;
+	reset_phonon_state(phonon);
 	return true;
 }
 bool sound::is_active() { return src && parent; }
@@ -764,12 +887,14 @@ void sound::render(float* out, int frames, int depth) {
 	if (!src || !playing) return;
 	uint64_t now = g_frame_clock;
 	float vol, pn, pt, pos_vol, pos_pan;
+	bool is_positioned;
+	spatial_params sp;
 	{
 		std::lock_guard<spinlock> l(params_lock);
 		vol = volume.at(now);
 		pn = pan.at(now);
 		pt = pitch.at(now);
-		positioning(pos_vol, pos_pan);
+		sp = snapshot_position(is_positioned);
 	}
 	unsigned int ch = src->channels();
 	float* raw = scratch(1, depth, size_t(max_render_frames) * ch);
@@ -797,6 +922,7 @@ void sound::render(float* out, int frames, int depth) {
 		if (got < frames) memset(st + got * 2, 0, (frames - got) * 2 * sizeof(float));
 	}
 	process_fx(st, frames);
+	spatialize(st, frames, sp, is_positioned, pos_vol, pos_pan);
 	apply_gain(st, out, frames, vol + pos_vol, pn, pos_pan);
 	if (src_ended) {
 		playing = false;
@@ -805,8 +931,8 @@ void sound::render(float* out, int frames, int depth) {
 }
 
 // Script bindings.
-static sound* script_sound_factory() { return new sound(); }
-static mixer* script_mixer_factory() { return new mixer(); }
+sound* make_sound() { return new sound(); }
+mixer* make_mixer() { return new mixer(); }
 template <bool (sound_base::*F)(float)> static void void_setter(sound_base* obj, float v) { (obj->*F)(v); }
 static CScriptArray* to_script_array(const std::vector<std::string>& v) {
 	CScriptArray* a = CScriptArray::Create(g_ScriptEngine->GetTypeInfoByDecl("array<string>"), asUINT(v.size()));
@@ -818,8 +944,11 @@ static CScriptArray* script_input_devices() { return to_script_array(get_input_d
 static unsigned int script_output_device_count() { return unsigned(get_output_device_names().size()); }
 static unsigned int script_input_device_count() { return unsigned(get_input_device_names().size()); }
 static void script_set_output_device(unsigned int d) { set_output_device(d); }
-static bool script_get_global_hrtf() { return g_global_hrtf; }
-static void script_set_global_hrtf(bool enable) { g_global_hrtf = enable; }
+bool get_global_hrtf() { return g_global_hrtf; }
+void set_global_hrtf(bool enable) {
+	g_global_hrtf = enable;
+	if (enable) phonon_init();
+}
 // A plain array handle parameter hands its reference to the callee.
 static bool script_push_floats(sound* s, CScriptArray* data, bool end_stream, int pcm_rate, int pcm_channels) {
 	bool r = s->push_floats(data, end_stream, pcm_rate, pcm_channels);
@@ -856,6 +985,7 @@ void RegisterNvsound(asIScriptEngine* engine) {
 	std::string ns = engine->GetDefaultNamespace();
 	std::string default_pack = ns.empty() ? "sound_default_pack" : ns + "::sound_default_pack";
 	RegisterLegacyPack(engine);
+	engine->RegisterGlobalFunction("void set_impulse_response_quality(float tail_seconds = 1.5, int rate_divisor = 1)", asFUNCTION(set_impulse_response_quality), asCALL_CDECL);
 	engine->RegisterGlobalFunction("void set_sound_default_pack(pack_interface@+ pack) property", asFUNCTION(set_default_pack), asCALL_CDECL);
 	engine->RegisterGlobalFunction("pack_interface@ get_sound_default_pack() property", asFUNCTION(get_default_pack), asCALL_CDECL);
 	engine->RegisterGlobalFunction("void set_sound_default_decryption_key(const string&in key) property", asFUNCTION(set_decryption_key), asCALL_CDECL);
@@ -865,9 +995,11 @@ void RegisterNvsound(asIScriptEngine* engine) {
 	engine->RegisterFuncdef("bool sound_seek_callback(uint offset, string user_data)");
 	engine->RegisterObjectType("mixer", 0, asOBJ_REF);
 	engine->RegisterObjectType("sound", 0, asOBJ_REF);
-	engine->RegisterObjectBehaviour("mixer", asBEHAVE_FACTORY, "mixer@ m()", asFUNCTION(script_mixer_factory), asCALL_CDECL);
+	engine->RegisterObjectBehaviour("mixer", asBEHAVE_FACTORY, "mixer@ m()", asFUNCTION(make_mixer), asCALL_CDECL);
 	register_sound_base<mixer>(engine, "mixer");
-	engine->RegisterObjectBehaviour("sound", asBEHAVE_FACTORY, "sound@ s()", asFUNCTION(script_sound_factory), asCALL_CDECL);
+	engine->RegisterObjectMethod("mixer", "bool set_impulse_response(const string&in response, float dry = 1.0f, float wet = 0.35f, const string&in response_right = \"\", float spread = 1.0f)", asMETHOD(sound_base, set_impulse_response), asCALL_THISCALL);
+	engine->RegisterObjectMethod("mixer", "bool set_impulse_response_params(float dry, float wet, float spread = 1.0f)", asMETHOD(sound_base, set_impulse_response_params), asCALL_THISCALL);
+	engine->RegisterObjectBehaviour("sound", asBEHAVE_FACTORY, "sound@ s()", asFUNCTION(make_sound), asCALL_CDECL);
 	register_sound_base<sound>(engine, "sound");
 	engine->RegisterObjectMethod("sound", "const string& get_loaded_filename() const property", asMETHOD(sound, get_loaded_filename), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound", ("bool load(const string&in filename, const pack_interface@+ pack = " + default_pack + ", bool allow_preloads = true)").c_str(), asMETHOD(sound, load), asCALL_THISCALL);
@@ -902,8 +1034,8 @@ void RegisterNvsound(asIScriptEngine* engine) {
 	engine->RegisterGlobalFunction("void set_sound_output_device(uint device) property", asFUNCTION(script_set_output_device), asCALL_CDECL);
 	engine->RegisterGlobalFunction("uint get_sound_output_device_count() property", asFUNCTION(script_output_device_count), asCALL_CDECL);
 	engine->RegisterGlobalFunction("array<string>@ get_sound_output_devices() property", asFUNCTION(script_output_devices), asCALL_CDECL);
-	engine->RegisterGlobalFunction("bool get_sound_global_hrtf() property", asFUNCTION(script_get_global_hrtf), asCALL_CDECL);
-	engine->RegisterGlobalFunction("void set_sound_global_hrtf(bool enable) property", asFUNCTION(script_set_global_hrtf), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool get_sound_global_hrtf() property", asFUNCTION(get_global_hrtf), asCALL_CDECL);
+	engine->RegisterGlobalFunction("void set_sound_global_hrtf(bool enable) property", asFUNCTION(set_global_hrtf), asCALL_CDECL);
 	engine->RegisterGlobalProperty("mixer@ sound_default_mixer", &g_default_mixer);
 }
 

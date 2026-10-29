@@ -531,6 +531,7 @@ int ConfigureEngine(asIScriptEngine *engine) {
 	engine->SetDefaultNamespace("steam");
 	nvsound::RegisterNvsound(engine);
 	nvsound::RegisterNvsoundMicrophone(engine);
+	nvsound::RegisterNvsoundEnvironment(engine);
 	system_namespace();
 	engine->EndConfigGroup();
 	engine->BeginConfigGroup("tonesynth");

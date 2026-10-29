@@ -8,6 +8,9 @@
 // p slides the clip's pan from left to right, h slides its pitch from 50 to 200 percent.
 // l starts or stops a looping stream that circles you using the legacy set_position math; arrows move you.
 // g fades a two sound mixer out and back in, m reports the microphone's format and loudness, escape quits.
+// t turns Steam Audio HRTF on or off for the circling stream; compare the two while it goes round you.
+// v moves the music into a sound_environment: open space, then a concrete room, then the same room with a wall between you and it, then back out.
+// i puts the clip and music through a convolution reverb (a synthesized small hall), then the same with the tail centred, then off.
 // e steps through set_fx presets on the clip and music (try 7 first), shift+e clears them.
 const string[] fx_names = {"lowpass at 600 hertz", "highpass at 2 kilohertz", "bandpass at 1 kilohertz", "freeverb, big room", "plate reverb", "DirectX reverb, 2.5 seconds", "I3DL2 reverb with predelay", "rotate once a second", "volume to minus 20 decibels"};
 const string[] fx_strings = {"lowpass:600:0:0.7", "highpass:2000:0:0.7", "bandpass:1000:1:0", "freeverb:1:0.8:0.85:0.4:1", "plate:1:0.5:1.4:0.75:0.3:1:0.02", "reverb:0:-6:2500:0.4", "i3DL2reverb:-1000:-100:0:2.5:0.8:-1500:0.03:0:0.05:100:100:5000", "rotate:1", "volume:0.8"};
@@ -28,6 +31,14 @@ void main() {
 	group_b.load("data/audio/points.ogg");
 	steam::microphone@ mic = null;
 	int fx_index = -1;
+	bool orbit_hrtf = false;
+	steam::sound_environment@ env = null;
+	steam::sound@ env_music = null;
+	int env_stage = 0;
+	steam::mixer ir_mixer;
+	clip.set_mixer(ir_mixer);
+	music.set_mixer(ir_mixer);
+	int ir_stage = 0;
 	float lx = 0, ly = 0, angle = 0;
 	timer orbit_clock;
 	screen_reader_speak("ready, output device " + steam::sound_output_devices[steam::sound_output_device]);
@@ -82,6 +93,46 @@ void main() {
 		if (key_pressed(KEY_L)) {
 			if (orbit.playing) orbit.stop();
 			else if (orbit.stream("data/audio/yfs_mono22k.wav")) orbit.play_looped();
+		}
+		if (key_pressed(KEY_T)) {
+			steam::sound_global_hrtf = true;
+			orbit_hrtf = !orbit_hrtf;
+			orbit.set_hrtf(orbit_hrtf);
+			screen_reader_speak(orbit_hrtf ? "HRTF on" : "HRTF off");
+		}
+		if (key_pressed(KEY_I)) {
+			// The sedan response isn't in the repository, so its stage is skipped where it hasn't been copied in.
+			ir_stage = (ir_stage + 1) % (file_exists("data/audio/sedan_speakers_front.wav") ? 4 : 3);
+			if (ir_stage == 0) ir_mixer.set_impulse_response("");
+			// Responses aren't scaled on load, so wet has to make up for how loud each one is: the sedan's peaks at about +15 dB, so it plays wet only at 0.3.
+			else if (ir_stage == 3) ir_mixer.set_impulse_response("data/audio/sedan_speakers_front.wav", 0.0, 0.3);
+			else ir_mixer.set_impulse_response("data/audio/hall_ir.wav", 1.0, 0.5, "", ir_stage == 1 ? 1.0 : 0.0);
+			string[] stages = {"convolution reverb off", "convolution reverb, following the pan", "convolution reverb, centred", "through the front speakers of a sedan"};
+			screen_reader_speak(stages[ir_stage]);
+		}
+		if (key_pressed(KEY_V)) {
+			env_stage = (env_stage + 1) % 4;
+			@env_music = null;
+			@env = null;
+			if (env_stage > 0) {
+				@env = steam::sound_environment();
+				env.set_listener(0, 0, 0, 0);
+				if (env_stage >= 2) { // Six concrete slabs around both of you.
+					env.add_box("concrete", -9, 9, -9, 9, -10, -9);
+					env.add_box("concrete", -9, 9, -9, 9, 9, 10);
+					env.add_box("concrete", -10, -9, -9, 9, -9, 9);
+					env.add_box("concrete", 9, 10, -9, 9, -9, 9);
+					env.add_box("concrete", -9, 9, -10, -9, -9, 9);
+					env.add_box("concrete", -9, 9, 9, 10, -9, 9);
+				}
+				if (env_stage == 3) env.add_box("wood", 1.5, 2, -9, 9, -9, 9);
+				@env_music = env.new_sound();
+				env_music.stream("data/audio/441.ogg");
+				env_music.set_position(0, 0, 0, 4, 3, 0);
+				env_music.play_looped();
+			}
+			string[] stages = {"environment off", "open space", "concrete room", "concrete room, wooden wall between you"};
+			screen_reader_speak(stages[env_stage]);
 		}
 		if (key_down(KEY_LEFT)) lx -= 0.05;
 		if (key_down(KEY_RIGHT)) lx += 0.05;

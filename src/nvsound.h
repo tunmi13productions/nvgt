@@ -109,8 +109,12 @@ void abort_push_bytes(push_bytes* p);
 std::vector<float> resample_interleaved(const float* in, uint64_t frames, unsigned int channels, unsigned int rate_in, unsigned int rate_out, uint64_t& frames_out);
 void stop_stream_feeder();
 
+class convolver;
 class effect;
 class mixer;
+struct phonon_state;
+struct spatial_params;
+class sound_environment;
 // Shared by sounds and mixers: refcounting, the output mixer, volume/pan/pitch with slides, and basic positioning.
 class sound_base {
 protected:
@@ -126,8 +130,16 @@ protected:
 	std::vector<std::unique_ptr<effect>> effects;
 	std::atomic<int> effect_count{0};
 	void process_fx(float* frames, int count);
+	// set_impulse_response's convolution reverb. The convolver is created once and never replaced, so the audio thread can read the pointer without a lock; responses are swapped inside it.
+	std::unique_ptr<convolver> ir;
+	std::atomic<bool> ir_enabled{false};
+	std::atomic<float> ir_dry{1.0f}, ir_wet{0.35f}, ir_spread{1.0f};
+	void process_ir(float* frames, int count, int depth);
 	void apply_gain(const float* in, float* out, int frames, float vol_db, float pan_value, float position_pan);
-	void positioning(float& vol_db, float& pan_value);
+	phonon_state* phonon = nullptr; // Created when HRTF is first needed, and only touched by the audio thread after that.
+	void spatialize(float* frames, int count, const spatial_params& p, bool is_positioned, float& vol_db, float& pan_value);
+	void ensure_phonon();
+	spatial_params snapshot_position(bool& is_positioned); // Must be called with params_lock held.
 public:
 	mixer* parent = nullptr;
 	bool set_parent(mixer* m, bool internal = false); // Moves this node within the mixer tree without the checks set_mixer does.
@@ -150,8 +162,11 @@ public:
 	bool is_pan_sliding();
 	bool is_pitch_sliding();
 	bool set_position(float listener_x, float listener_y, float listener_z, float sound_x, float sound_y, float sound_z, float rotation, float pan_step, float volume_step);
-	void set_hrtf(bool enable) { use_hrtf = enable; }
+	void set_hrtf(bool enable);
+	bool attach_environment(sound_environment* env);
 	int set_fx(const std::string& fx, int index = -1);
+	bool set_impulse_response(const std::string& response, float dry = 1.0f, float wet = 0.35f, const std::string& response_right = "", float spread = 1.0f);
+	bool set_impulse_response_params(float dry, float wet, float spread = 1.0f);
 	virtual bool set_mixer(mixer* m) = 0;
 };
 
@@ -226,9 +241,16 @@ unsigned int get_input_device();
 void set_input_device(unsigned int index);
 std::vector<std::string> get_input_device_names();
 
+void set_impulse_response_quality(float tail_seconds = 1.5f, int rate_divisor = 1);
+bool get_global_hrtf();
+void set_global_hrtf(bool enable);
 void close_all_microphones(); // Called by shutdown, so no microphone touches SDL after SDL_Quit.
+
+sound* make_sound(); // For code that can't see the types sounds and mixers own.
+mixer* make_mixer();
 
 void RegisterNvsound(asIScriptEngine* engine);
 void RegisterNvsoundMicrophone(asIScriptEngine* engine);
+void RegisterNvsoundEnvironment(asIScriptEngine* engine);
 
 } // namespace nvsound
