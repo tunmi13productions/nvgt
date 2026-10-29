@@ -33,11 +33,13 @@
 #include "dr_mp3.h"
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
-#define MINIAUDIO_IMPLEMENTATION
-#include <miniaudio.h>
+#define PLATEVERB_IMPLEMENTATION
+#include "plateverb.h"
 #define RND_IMPLEMENTATION
 #include "rnd.h"
 #define SPEECH_IMPLEMENTATION
 #include "speech.h"
 #define THREAD_IMPLEMENTATION
 #include "thread.h"
+#define VERBLIB_IMPLEMENTATION
+#include "verblib.h"

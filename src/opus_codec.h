@@ -28,7 +28,5 @@
 
 class asIScriptEngine;
 
-// Registers the opus_encoder and opus_decoder script classes. Called from RegisterSoundsystem so
-// it lands after the opus_application_type and opus_signal_type enums core already registers --
-// those supply OPUS_APPLICATION_VOIP and OPUS_SIGNAL_VOICE, so they are not redeclared here.
+// Registers the opus_encoder and opus_decoder script classes, and the opus_application_type and opus_signal_type enums their constructors take values from.
 void RegisterOpusCodec(asIScriptEngine* engine);

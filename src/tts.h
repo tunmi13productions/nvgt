@@ -23,9 +23,11 @@
 #include <cstdlib>
 #include <angelscript.h>
 #include <scriptarray.h>
-#include "sound.h"
 
+namespace nvsound {
 class sound;
+class pcm_push_source;
+}
 class tts_engine_impl;
 class tts_engine;
 
@@ -118,29 +120,22 @@ class tts_voice {
 	std::vector<voice_info> voices;
 	int current_voice_index;
 	std::string current_language;
-	typedef std::shared_ptr<sound> soundptr;
-	typedef std::queue<soundptr> sound_queue;
-	sound_queue queue;
-	std::mutex queue_mtx;
-	sound_queue fade_queue;
-	std::atomic_flag speaking;
+	// Speech from engines that hand back audio plays through one sound per voice. Each utterance is pushed onto the end of it, so queued speech follows on with no gap, and an interrupt drops what is waiting.
+	nvsound::sound* output = nullptr;
+	std::shared_ptr<nvsound::pcm_push_source> queue;
 	voice_info *get_voice_info(int voice_index);
 	void *speak_to_pcm(const std::string &text, tts_audio_data** datablock); // Returns pointer to trimmed sample.
-	bool schedule(soundptr &s, bool interrupt);
-	void clear();
-	bool fade(soundptr &item);
-	void cleanup_completed_fades();
-	static void at_end(void *pUserData, ma_sound *pSound);
-	static ma_result job_proc(ma_job *pJob);
+	bool schedule(tts_audio_data* datablock, void* samples, bool interrupt);
 public:
 	tts_voice(const std::string &engine_list = "");
+	~tts_voice();
 	void AddRef();
 	void Release();
 	bool speak(const std::string &text, bool interrupt = false);
 	bool speak_to_file(const std::string &filename, const std::string &text);
 	std::string speak_to_memory(const std::string &text);
 	bool speak_wait(const std::string &text, bool interrupt = false);
-	sound *speak_to_sound(const std::string &text);
+	nvsound::sound *speak_to_sound(const std::string &text);
 	bool speak_interrupt(const std::string &text) { return speak(text, true); }
 	bool speak_interrupt_wait(const std::string &text) { return speak_wait(text, true); }
 	float get_rate();

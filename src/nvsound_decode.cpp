@@ -298,6 +298,59 @@ std::unique_ptr<decoder> open_decoder(std::unique_ptr<std::istream> stream) {
 	return nullptr;
 }
 
+// Lets a stream that can't seek, such as a live network response, be rewound over its first bytes while its format is worked out. Everything read is recorded until the window is full; from then on reads pass straight through and only the current position can be asked for. The source is read on the caller's thread and isn't owned.
+class window_streambuf : public std::streambuf {
+	std::istream* src;
+	std::string seen;
+	size_t cap, pos = 0; // pos is how far the consumer has been handed data, counting what sits unread in buf.
+	bool closed = false;
+	char buf[4096];
+	std::streampos current() const { return std::streampos(std::streamoff(pos - (egptr() - gptr()))); }
+protected:
+	int_type underflow() override {
+		size_t n;
+		if (pos < seen.size()) {
+			n = std::min(sizeof(buf), seen.size() - pos);
+			memcpy(buf, seen.data() + pos, n);
+		} else {
+			src->read(buf, sizeof(buf));
+			n = size_t(src->gcount());
+			if (!n) return traits_type::eof();
+			if (!closed && seen.size() + n <= cap) seen.append(buf, n);
+			else closed = true;
+		}
+		pos += n;
+		setg(buf, buf, buf + n);
+		return traits_type::to_int_type(buf[0]);
+	}
+	std::streampos seekoff(std::streamoff off, std::ios_base::seekdir dir, std::ios_base::openmode) override {
+		std::streamoff here = std::streamoff(current());
+		if (dir == std::ios_base::cur && off == 0) return here;
+		if (closed || dir == std::ios_base::end) return std::streampos(std::streamoff(-1));
+		std::streamoff target = dir == std::ios_base::beg ? off : here + off;
+		if (target < 0) return std::streampos(std::streamoff(-1));
+		// Going forward past what has been recorded means reading up to it.
+		while (size_t(target) > seen.size() && !closed) {
+			pos = seen.size();
+			setg(buf, buf, buf);
+			if (underflow() == traits_type::eof()) return std::streampos(std::streamoff(-1));
+		}
+		if (closed) return std::streampos(std::streamoff(-1));
+		pos = size_t(target);
+		setg(buf, buf, buf);
+		return std::streampos(target);
+	}
+	std::streampos seekpos(std::streampos p, std::ios_base::openmode which) override { return seekoff(std::streamoff(p), std::ios_base::beg, which); }
+public:
+	window_streambuf(std::istream* source, size_t window) : src(source), cap(window) {}
+};
+class window_istream : public std::istream {
+	window_streambuf sb;
+public:
+	window_istream(std::istream* source, size_t window) : std::istream(nullptr), sb(source, window) { rdbuf(&sb); }
+};
+std::unique_ptr<std::istream> open_window_stream(std::istream* source, size_t window) { return std::make_unique<window_istream>(source, window); }
+
 std::vector<float> resample_interleaved(const float* in, uint64_t frames, unsigned int channels, unsigned int rate_in, unsigned int rate_out, uint64_t& frames_out) {
 	frames_out = uint64_t((double(frames) * rate_out) / rate_in + 0.5);
 	std::vector<float> out(frames_out * channels);
@@ -583,6 +636,30 @@ public:
 		std::lock_guard<std::mutex> l(m);
 		ending = true;
 	}
+	// Keeps only the next fade_frames of what is waiting, faded out to silence, so stopping mid-word doesn't click.
+	void clear(uint64_t fade_frames) {
+		std::lock_guard<std::mutex> l(m);
+		std::vector<float> tail;
+		tail.reserve(std::min<uint64_t>(fade_frames, buffered) * ch);
+		for (size_t i = 0; i < chunks.size() && tail.size() < fade_frames * ch; i++) {
+			const std::vector<float>& c = chunks[i];
+			size_t from = i == 0 ? front_pos : 0, n = std::min<size_t>(c.size() - from, fade_frames * ch - tail.size());
+			tail.insert(tail.end(), c.begin() + from, c.begin() + from + n);
+		}
+		size_t frames = tail.size() / ch;
+		for (size_t f = 0; f < frames; f++) {
+			float g = 1.0f - float(f + 1) / float(frames);
+			for (unsigned int c = 0; c < ch; c++) tail[f * ch + c] *= g;
+		}
+		chunks.clear();
+		front_pos = 0;
+		buffered = frames;
+		if (frames) chunks.push_back(std::move(tail));
+	}
+	uint64_t queued() {
+		std::lock_guard<std::mutex> l(m);
+		return buffered;
+	}
 	unsigned int channels() const override { return ch; }
 	unsigned int sample_rate() const override { return rate; }
 	uint64_t read(float* out, uint64_t frames, bool& ended) override {
@@ -622,6 +699,8 @@ public:
 std::shared_ptr<pcm_push_source> make_pcm_push_source(unsigned int sample_rate, unsigned int channels) { return std::make_shared<pcm_push_source>(sample_rate, channels); }
 void pcm_push(pcm_push_source* s, const float* samples, size_t count) { s->push(samples, count); }
 void pcm_push_end(pcm_push_source* s) { s->end(); }
+void pcm_push_clear(pcm_push_source* s, uint64_t fade_frames) { s->clear(fade_frames); }
+uint64_t pcm_push_queued(pcm_push_source* s) { return s->queued(); }
 std::shared_ptr<source> as_source(std::shared_ptr<pcm_push_source> s) { return s; }
 
 // The bytes of an encoded file pushed in pieces. Everything pushed is kept, as BASS kept it, which is what lets the decoder probe rewind to the start.

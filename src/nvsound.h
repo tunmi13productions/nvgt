@@ -1,5 +1,5 @@
 /* nvsound.h - NVGT's sound engine: SDL3 device output, our own mixer tree, Steam Audio for spatialization.
- * This replaces the MiniAudio based engine in sound.cpp/sound_nodes.cpp and exposes the API that the legacy_sound plugin used to (sound, mixer, sound_environment).
+ * It replaced a MiniAudio based engine, and exposes the API that the legacy_sound plugin did (sound, mixer, sound_environment).
  *
  * NVGT - NonVisual Gaming Toolkit
  * Copyright (c) 2022-2025 Sam Tupy
@@ -67,6 +67,10 @@ public:
 };
 std::unique_ptr<decoder> open_decoder(std::unique_ptr<std::istream> stream);
 std::unique_ptr<std::istream> open_memory_stream(std::shared_ptr<const std::string> data);
+// Wraps a stream that can't seek so open_decoder can rewind over its first window bytes instead of reading all of it into memory. The source isn't owned.
+std::unique_ptr<std::istream> open_window_stream(std::istream* source, size_t window = 128 * 1024);
+// Opens a file the way sound.load does: from pack if it's active, otherwise from the filesystem, with the default decryption key applied.
+std::unique_ptr<std::istream> open_sound_file(const std::string& filename, const pack_interface* pack);
 
 // Fully decoded audio, already converted to the engine's sample rate.
 struct pcm_data {
@@ -96,6 +100,8 @@ class pcm_push_source;
 std::shared_ptr<pcm_push_source> make_pcm_push_source(unsigned int sample_rate, unsigned int channels);
 void pcm_push(pcm_push_source* s, const float* samples, size_t count);
 void pcm_push_end(pcm_push_source* s);
+void pcm_push_clear(pcm_push_source* s, uint64_t fade_frames); // Drops everything waiting to play, fading out over the next fade_frames instead of cutting off.
+uint64_t pcm_push_queued(pcm_push_source* s); // Frames waiting to be played.
 std::shared_ptr<source> as_source(std::shared_ptr<pcm_push_source> s);
 
 // An encoded file pushed in pieces (push_memory without a sample rate). Reads wait for more data once the decoder is running.
@@ -203,6 +209,9 @@ public:
 	bool load_callbacks(asIScriptFunction* close_cb, asIScriptFunction* length_cb, asIScriptFunction* read_cb, asIScriptFunction* seek_cb, const std::string& data, const std::string& preload_filename = "");
 	bool push_memory(const std::string& data, bool end_stream = false, int pcm_rate = 0, int pcm_channels = 0);
 	bool push_floats(CScriptArray* data, bool end_stream = false, int pcm_rate = 0, int pcm_channels = 0);
+	// For C++ callers such as text to speech and tone_synth. load_pcm copies the samples and converts them to the engine's rate; load_source plays any source, such as a push source the caller keeps feeding.
+	bool load_pcm(const float* samples, uint64_t frames, unsigned int sample_rate, unsigned int channels, const std::string& name = "pcm");
+	bool load_source(std::shared_ptr<source> s, const std::string& name = "");
 	bool close();
 	bool play(bool reset_loop_state = true);
 	bool play_wait();
@@ -252,5 +261,6 @@ mixer* make_mixer();
 void RegisterNvsound(asIScriptEngine* engine);
 void RegisterNvsoundMicrophone(asIScriptEngine* engine);
 void RegisterNvsoundEnvironment(asIScriptEngine* engine);
+void RegisterNvsoundDecoder(asIScriptEngine* engine);
 
 } // namespace nvsound

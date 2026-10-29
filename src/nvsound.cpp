@@ -16,10 +16,12 @@
 #include "nvsound_effects.h"
 #include "nvsound_phonon.h"
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
 #include <angelscript.h>
+#include <reactphysics3d/mathematics/Vector3.h>
 #include <scriptarray.h>
 #include <SDL3/SDL.h>
 #include <Poco/Format.h>
@@ -49,6 +51,7 @@ static unsigned int g_input_device = 0xffffffff; // Means the system default.
 static bool g_initialized = false;
 static bool g_shut_down = false; // Once the engine has shut down at exit, nothing may start it again, since SDL is about to be torn down.
 static bool g_global_hrtf = true;
+static void release_played(bool all);
 // Loading fully decodes files up to this long. Longer ones keep their compressed bytes in memory and decode as they play.
 static const double g_preload_max_seconds = 30.0;
 
@@ -110,7 +113,10 @@ static bool open_output(unsigned int index) {
 	}
 	SDL_AudioSpec spec{SDL_AUDIO_F32, 2, g_sample_rate};
 	g_output_stream = SDL_OpenAudioDeviceStream(dev, &spec, audio_callback, nullptr);
-	if (!g_output_stream) return false;
+	if (!g_output_stream) {
+		NVGT_ERROR("nvgt.sound", Poco::format("could not open the audio output device: %s", std::string(SDL_GetError())));
+		return false;
+	}
 	SDL_ResumeAudioStreamDevice(g_output_stream);
 	return true;
 }
@@ -132,6 +138,7 @@ bool init() {
 	return true;
 }
 void shutdown() {
+	release_played(true);
 	g_shut_down = true;
 	close_all_microphones();
 	if (g_output_stream) SDL_DestroyAudioStream(g_output_stream);
@@ -471,6 +478,11 @@ static std::unique_ptr<std::istream> open_file(const std::string& triplet) {
 	g_service->cleanup_triplet(triplet);
 	return s;
 }
+std::unique_ptr<std::istream> open_sound_file(const std::string& filename, const pack_interface* pack) {
+	if (!init()) return nullptr;
+	std::string key = prepare_file(filename, pack);
+	return key.empty() ? nullptr : open_file(key);
+}
 static std::shared_ptr<const std::string> read_all(std::istream& in) {
 	auto data = std::make_shared<std::string>();
 	char buf[65536];
@@ -655,8 +667,13 @@ bool sound::load(const std::string& filename, const pack_interface* pack, bool a
 		return true;
 	}
 	std::unique_ptr<std::istream> in = open_file(key);
-	if (!in) return false;
-	return load_bytes(read_all(*in), key, filename, allow_preloads);
+	if (!in) {
+		NVGT_ERROR("nvgt.sound", Poco::format("could not open %s", filename));
+		return false;
+	}
+	if (load_bytes(read_all(*in), key, filename, allow_preloads)) return true;
+	NVGT_ERROR("nvgt.sound", Poco::format("could not load %s: it isn't audio in a supported format, or it is damaged", filename));
+	return false;
 }
 bool sound::stream(const std::string& filename, const pack_interface* pack) {
 	if (!init()) return false;
@@ -664,8 +681,15 @@ bool sound::stream(const std::string& filename, const pack_interface* pack) {
 	std::string key = prepare_file(filename, pack);
 	if (key.empty()) return false;
 	std::unique_ptr<std::istream> in = open_file(key);
-	std::unique_ptr<decoder> dec = in ? open_decoder(std::move(in)) : nullptr;
-	if (!dec) return false;
+	if (!in) {
+		NVGT_ERROR("nvgt.sound", Poco::format("could not open %s", filename));
+		return false;
+	}
+	std::unique_ptr<decoder> dec = open_decoder(std::move(in));
+	if (!dec) {
+		NVGT_ERROR("nvgt.sound", Poco::format("could not stream %s: it isn't audio in a supported format, or it is damaged", filename));
+		return false;
+	}
 	attach_source(make_stream_source(std::move(dec)), filename);
 	return true;
 }
@@ -807,6 +831,26 @@ bool sound::push_floats(CScriptArray* data, bool end_stream, int pcm_rate, int p
 	if (end_stream) pcm_push_end(pcm_pushing.get());
 	return true;
 }
+bool sound::load_pcm(const float* samples, uint64_t frames, unsigned int sample_rate, unsigned int channels, const std::string& name) {
+	if (!init() || !samples || !frames || !sample_rate || channels < 1 || channels > max_source_channels) return false;
+	close();
+	auto pcm = std::make_shared<pcm_data>();
+	pcm->channels = channels;
+	pcm->sample_rate = g_sample_rate;
+	if (sample_rate != unsigned(g_sample_rate)) pcm->samples = resample_interleaved(samples, frames, channels, sample_rate, g_sample_rate, pcm->frames);
+	else {
+		pcm->samples.assign(samples, samples + frames * channels);
+		pcm->frames = frames;
+	}
+	attach_source(make_pcm_source(pcm), name);
+	return true;
+}
+bool sound::load_source(std::shared_ptr<source> s, const std::string& name) {
+	if (!init() || !s) return false;
+	close();
+	attach_source(s, name);
+	return true;
+}
 bool sound::close() {
 	if (!src && !bytes_pushing && !pcm_pushing) return false;
 	if (bytes_pushing) abort_push_bytes(bytes_pushing.get());
@@ -930,6 +974,45 @@ void sound::render(float* out, int frames, int depth) {
 	}
 }
 
+// sound_play keeps each sound it starts alive until it finishes, so a script can fire one and forget it. Finished ones are let go the next time sound_play is called, and at shutdown.
+static std::mutex g_played_mutex;
+static std::vector<sound*> g_played;
+static void release_played(bool all) {
+	std::vector<sound*> done;
+	{
+		std::lock_guard<std::mutex> l(g_played_mutex);
+		auto keep = std::partition(g_played.begin(), g_played.end(), [all](sound* s) { return !all && s->is_playing(); });
+		done.assign(keep, g_played.end());
+		g_played.erase(keep, g_played.end());
+	}
+	for (sound* s : done) s->release(); // Outside the lock, since releasing the last reference takes the graph lock.
+}
+// position, if given, is relative to a listener at the origin facing north, as set_position takes it. A sound that isn't playing yet (autoplay false) is let go on the next call unless the script holds on to it.
+static sound* sound_play(const std::string& path, const reactphysics3d::Vector3& position, float volume, float pan, float pitch, mixer* mix, const pack_interface* pack, bool autoplay) {
+	release_played(false);
+	sound* s = new sound();
+	if (!s->load(path, pack)) {
+		s->release();
+		return nullptr;
+	}
+	if (mix) s->set_mixer(mix);
+	if (position.x != FLT_MAX || position.y != FLT_MAX || position.z != FLT_MAX) s->set_position(0, 0, 0, position.x, position.y, position.z, 0, 1, 1);
+	s->set_volume(volume);
+	s->set_pan(pan);
+	s->set_pitch(pitch);
+	if (autoplay) s->play();
+	s->add_ref();
+	{
+		std::lock_guard<std::mutex> l(g_played_mutex);
+		g_played.push_back(s);
+	}
+	return s;
+}
+// How far a URL stream reads ahead of what is playing. The gauge is for the most recently active one.
+static void set_netstream_buffer_size(unsigned int bytes) { g_netstream_buffer_size = bytes; }
+static unsigned int get_netstream_buffer_size() { return unsigned(g_netstream_buffer_size); }
+static unsigned int get_netstream_buffered() { return unsigned(g_netstream_buffered.load()); }
+
 // Script bindings.
 sound* make_sound() { return new sound(); }
 mixer* make_mixer() { return new mixer(); }
@@ -1037,6 +1120,10 @@ void RegisterNvsound(asIScriptEngine* engine) {
 	engine->RegisterGlobalFunction("bool get_sound_global_hrtf() property", asFUNCTION(get_global_hrtf), asCALL_CDECL);
 	engine->RegisterGlobalFunction("void set_sound_global_hrtf(bool enable) property", asFUNCTION(set_global_hrtf), asCALL_CDECL);
 	engine->RegisterGlobalProperty("mixer@ sound_default_mixer", &g_default_mixer);
+	engine->RegisterGlobalFunction(("sound@ sound_play(const string&in path, const vector&in position = vector(FLOAT_MAX, FLOAT_MAX, FLOAT_MAX), float volume = 0.0, float pan = 0.0, float pitch = 100.0, mixer@+ mix = null, const pack_interface@+ pack_file = " + default_pack + ", bool autoplay = true)").c_str(), asFUNCTION(sound_play), asCALL_CDECL);
+	engine->RegisterGlobalFunction("void set_sound_netstream_buffer_size(uint bytes) property", asFUNCTION(set_netstream_buffer_size), asCALL_CDECL);
+	engine->RegisterGlobalFunction("uint get_sound_netstream_buffer_size() property", asFUNCTION(get_netstream_buffer_size), asCALL_CDECL);
+	engine->RegisterGlobalFunction("uint get_sound_netstream_buffered() property", asFUNCTION(get_netstream_buffered), asCALL_CDECL);
 }
 
 } // namespace nvsound

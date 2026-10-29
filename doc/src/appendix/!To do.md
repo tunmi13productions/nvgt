@@ -13,9 +13,6 @@ We have been holding off on these until the API stabalizes so that we don't teac
 ### Joystick object
 The joystick class in NVGT is still a no-op interface. There has already been a bit of code to begin the process of wrapping SDL's joystick support, but it is not yet complete.
 
-### tone_synth
-Another object from BGT we have not yet reimplemented, though the beginnings of tone generation will appear in miniaudio.
-
 ### Speech dispatcher and the `tts_voice` object
 Currently, NVGT's Speech Dispatcher implementation for Linux only works with the screen reader speech functions. At this time, we are still considering if we should implement it into the `tts_voice` object as well.
 
@@ -31,12 +28,6 @@ At the moment, we are using SDL's message box system to show simple dialogs rath
 2. Copying text does not work with ctrl+c.
 3. No internationalization, yes and no buttons are English on non-English windows.
 Either we will see if SDL will improve message boxes soon, or switch to something else.
-
-### Switch to miniaudio (in progress)
-Currently we use the Bass audio library for sound output, which functionally speaking does work great. However Bass is not open source, and a commercial license must be purchased from [Un4seen](https://www.un4seen.com/bass.html) in order to sell commercial projects. For NVGT, this is not ideal and Bass was only used because it worked quite well at the time that NVGT was only being used to bolster Survive the Wild development with no opensource intentions. Instead, we plan to switch to [miniaudio](https://github.com/mackron/miniaudio) which is open source and in the public domain, and thus which will solve such commercial licensing issues. There has been much progress here and we are hopefully to have miniaudio integrated soon.
-
-### Recording from a microphone
-Especially since Survive the Wild has implemented voice chat support, people rightfully wonder how to record audio in NVGT. Survive the Wild does this with a plugin specifically designed for it's voice chat. The API is not one which we wish to support publicly as it is very limited and confined to stw's use case. This should come soon as miniaudio implementation has made much progress.
 
 ### Subscripting improvements
 * NVGT allows a scripter to execute Angelscript code from within their Angelscript code, such as the python eval function. The user is given control of what builtin NVGT functions and classes these subscripts have access to, but it's still a bit rough. Basically Angelscript provides us with this 32 bit DWORD where we can map certain registered functions to bitflags and restrict access to them if a calling module's access bitmask doesn't include a flag the functions were registered with. However this means that we have 32 systems or switches to choose from, so either we need to assign builtin systems to them in a better way, or investigate this feature Angelscript has which is known as config groups and see if we can use them for permission control. C++ plugins in particular complicate this issue.

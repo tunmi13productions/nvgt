@@ -1,5 +1,5 @@
 /* sound_service.cpp - sound service implementation code written by Caturria
- * This is responsible for providing miniaudio with data to play from various sources, from an encrypted pack file to a custom stream from the internet.
+ * This is responsible for providing the sound engine with data to play from various sources, from an encrypted pack file to a custom stream from the internet.
  *
  * NVGT - NonVisual Gaming Toolkit
  * Copyright (c) 2022-2025 Sam Tupy
@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <vector>
 #include <cassert>
-#include <miniaudio.h>
 #include "crypto.h"
 #include "datastreams.h" // sdl_file_stream, prebuffer_istream
 #include "misc_functions.h" // is_valid_utf8
@@ -30,27 +29,6 @@
 #include <iostream>
 #include <unordered_map>
 #include <mutex>
-
-/**
- * The VFS is the glue between the sound service and MiniAudio.
- * We have an opaque structure -- in this case a pointer to the sound_service implementation -- and a series of callbacks which provide MiniAudio an interface to it.
- */
-struct sound_service_vfs {
-	ma_vfs_callbacks callbacks;
-	sound_service *service;
-};
-#define vfs_cast(x) \
-	sound_service_vfs *vfs = static_cast<sound_service_vfs *>(x); \
-	if (vfs == NULL) \
-	{ \
-		return MA_ERROR; \
-	}
-#define file_cast(x) \
-	std::istream *stream = static_cast<std::istream *>(x); \
-	if (stream == NULL) \
-	{ \
-		return MA_ERROR; \
-	}
 
 class sound_service_impl : public sound_service {
 	/**
@@ -126,7 +104,6 @@ class sound_service_impl : public sound_service {
 	typedef std::vector<filter_registration> filter_array;
 	filter_array filters;
 	filter_registration default_filter; // Always access with atomic operations!
-	sound_service_vfs vfs;
 	typedef std::unordered_map<std::string, vfs_args> temp_args_t;
 	temp_args_t temp_args;
 	std::mutex temp_args_mtx;
@@ -158,16 +135,6 @@ public:
 		register_filter(null_filter::get_instance(), slot);
 		set_default_filter(slot);
 		assert(slot == null_filter_slot);
-		// Assemble the VFS, which gets passed to MiniAudio so that it can interface with this.
-		vfs.service = this;
-		vfs.callbacks.onClose = onClose;
-		vfs.callbacks.onInfo = onInfo;
-		vfs.callbacks.onOpen = onOpen;
-		vfs.callbacks.onOpenW = NULL; // Todo: do we need this?
-		vfs.callbacks.onRead = onRead;
-		vfs.callbacks.onSeek = onSeek;
-		vfs.callbacks.onTell = onTell;
-		vfs.callbacks.onWrite = NULL;
 	}
 	virtual ~sound_service_impl() {
 	}
@@ -255,7 +222,7 @@ public:
 		freg = (filter_slot == 0 ? std::atomic_load(&default_filter) : filters[filter_slot]);
 		args.filter_slot = freg->get_slot();
 		args.filter_directive = (filter_directive == nullptr ? freg->get_directive() : filter_directive);
-		// Build our triplet. This is the name that will actually be remembered by MiniAudio's resource manager.
+		// Build our triplet. This is the name the sound engine caches loaded audio under.
 		std::stringstream triplet;
 		triplet << name
 		        << "\x1e"
@@ -267,7 +234,7 @@ public:
 		return triplet.str();
 	}
 	std::istream *open_triplet(const char *triplet, size_t filter_slot = 0, const directive_t filter_directive = nullptr) {
-		// Get our VFS args back.
+		// Get the arguments prepare_triplet stored back.
 		vfs_args args;
 		if (!get_temp_args(triplet, args))
 			return nullptr;
@@ -298,93 +265,6 @@ public:
 			return source;
 		}
 		return filtered;
-	}
-
-	sound_service_vfs *get_vfs() {
-		return &vfs;
-	}
-
-private:
-	// Callbacks that glue MiniAudio to the sound service.
-
-	static ma_result onOpen(ma_vfs *pVFS, const char *pFilePath, ma_uint32 openMode, ma_vfs_file *pFile) {
-		vfs_cast(pVFS);
-		std::istream *file = vfs->service->open_triplet(pFilePath);
-		if (file == NULL) {
-			return MA_ERROR; // Not found, not permitted, etc.
-		}
-		*pFile = file;
-
-		return MA_SUCCESS;
-	}
-	static ma_result onClose(ma_vfs *pVFS, ma_vfs_file file) {
-
-		file_cast(file);
-		delete stream;
-
-		return MA_SUCCESS;
-	}
-	static ma_result onRead(ma_vfs *pVFS, ma_vfs_file file, void *pDst, size_t sizeInBytes, size_t *pBytesRead) {
-		if (pBytesRead) *pBytesRead = 0;
-		file_cast(file);
-		// Only a real end of stream stops a read. A failbit left behind by a refused seek must not be
-		// mistaken for one: a live stream refuses every seek it cannot satisfy, and ma_decoder_init
-		// asks for the length before it probes any format, so treating that as the end meant the very
-		// first probe poisoned every read after it and no backend ever saw a byte.
-		if (stream->eof()) return MA_AT_END;
-		if (!stream->good()) stream->clear();
-		stream->read((char *)pDst, sizeInBytes);
-		if (pBytesRead) *pBytesRead = stream->gcount();
-		return stream->gcount() > 0? MA_SUCCESS : MA_AT_END;
-	}
-	static ma_result onSeek(ma_vfs *pVFS, ma_vfs_file file, ma_int64 offset, ma_seek_origin origin) {
-		file_cast(file);
-		stream->clear();
-		std::ios_base::seekdir dir;
-		switch (origin) {
-			case ma_seek_origin_start:
-				dir = stream->beg;
-				break;
-			case ma_seek_origin_current:
-				dir = stream->cur;
-				break;
-			case ma_seek_origin_end:
-				dir = stream->end;
-				break;
-			default: // Should never get here.
-				return MA_ERROR;
-		}
-		stream->seekg(offset, dir);
-		if (stream->fail()) {
-			stream->clear(); // the reads that follow still need this stream, so leave it usable
-			return MA_NOT_IMPLEMENTED;
-		}
-		return MA_SUCCESS;
-	}
-	static ma_result onTell(ma_vfs *pVFS, ma_vfs_file file, ma_int64 *pCursor) {
-		file_cast(file);
-		stream->clear(); // tellg refuses to answer on a failed stream, and the failure may not be its own
-		ma_int64 result = stream->tellg();
-		*pCursor = result != -1? result : 0;
-		if (result == -1) {
-			stream->clear();
-			return MA_NOT_IMPLEMENTED;
-		}
-		return MA_SUCCESS;
-	}
-	static ma_result onInfo(ma_vfs *pVFS, ma_vfs_file file, ma_file_info *pInfo) {
-		file_cast(file);
-		stream->clear();
-		size_t cursor = stream->tellg();
-		stream->seekg(0, stream->end);
-		if (stream->fail()) {
-			pInfo->sizeInBytes = 0;
-			stream->clear();
-			return MA_NOT_IMPLEMENTED;
-		}
-		pInfo->sizeInBytes = stream->tellg();
-		stream->seekg(cursor, stream->beg);
-		return MA_SUCCESS;
 	}
 };
 
@@ -482,7 +362,7 @@ directive_t netstream_protocol::directive(std::istream *preopened) {
 	return std::make_shared<const netstream_handoff>(preopened);
 }
 std::istream *netstream_protocol::open_uri(const char *uri, const directive_t directive) const {
-	// A handed-off stream can be opened once; a second open (miniaudio's retry after a failed init) gets nothing, because the socket cannot rewind.
+	// A handed-off stream can be opened once; a second open gets nothing, because the socket cannot rewind.
 	if (directive) return std::static_pointer_cast<const netstream_handoff>(directive)->stream.exchange(nullptr);
 	try {
 		std::istream *stream = Poco::URIStreamOpener::defaultOpener().open(uri);

@@ -14,7 +14,6 @@
 #include <memory>
 #include <mutex>
 typedef std::shared_ptr<const void> directive_t;
-struct sound_service_vfs;
 struct vfs_args {
 	std::string name;
 	size_t protocol_slot = 0;
@@ -108,8 +107,6 @@ public:
 	 * Don't forget to call this or you leak.
 	 */
 	virtual bool cleanup_triplet(const std::string &triplet) = 0;
-	// The VFS is how Miniaudio itself communicates with this.
-	virtual sound_service_vfs *get_vfs() = 0;
 	static std::unique_ptr<sound_service> make();
 };
 

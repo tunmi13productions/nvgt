@@ -23,7 +23,7 @@ extern "C" {
 // Forward declare a few things so they'll work.
 class CScriptArray;
 class asIScriptEngine;
-class sound;
+namespace nvsound { class sound; }
 
 class tone_synth {
 public:
@@ -69,7 +69,7 @@ public:
 	bool rewind_ms(int amount);
 	int get_sample_rate();
 	int get_channels();
-	sound* generate_sound();
+	nvsound::sound* generate_sound();
 	CScriptArray* write_samples();
 	bool generate_file(const std::string& filename);
 

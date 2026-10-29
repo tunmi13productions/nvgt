@@ -14,15 +14,17 @@
 
 #include <limits>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <unordered_map>
 #include <thread>
-#include <miniaudio.h>
 #include <Poco/FileStream.h>
 #include <Poco/Format.h>
 #include <Poco/String.h>
 #include <Poco/StringTokenizer.h>
 #include <obfuscate.h>
 #include "nvgt_angelscript.h"
+#include "nvsound.h"
 #include "tts.h"
 #include "misc_functions.h"
 #include "UI.h"
@@ -31,8 +33,8 @@ using namespace std;
 
 // Trim prenormalized TTS based on minimum thresholds in dB. Size is in frames.
 template <class t> static t *tts_trim_internal(t *data, unsigned int* size_in_frames, int channels, float begin_db, float end_db) {
-	t min_begin_sample = ceil(ma_volume_db_to_linear(begin_db) * (double)numeric_limits<t>::max());
-	t min_end_sample = ceil(ma_volume_db_to_linear(end_db) * (double)numeric_limits<t>::max());
+	t min_begin_sample = ceil(pow(10.0, begin_db / 20.0) * (double)numeric_limits<t>::max());
+	t min_end_sample = ceil(pow(10.0, end_db / 20.0) * (double)numeric_limits<t>::max());
 	for (unsigned long i = 0; i < *size_in_frames; i++) {
 		double mean = 0;
 		for (int c = 0; c < channels; c++)
@@ -75,6 +77,42 @@ static void* tts_trim(tts_audio_data* data, float begin_db = -60, float end_db =
 		default:
 			return data->data;
 	}
+}
+
+// Engines hand back 16 bit signed or 8 bit unsigned samples.
+static vector<float> tts_to_float(const void* data, unsigned int size_in_bytes, unsigned int bitsize) {
+	vector<float> out;
+	if (bitsize == 16) {
+		const int16_t* s = (const int16_t*)data;
+		out.resize(size_in_bytes / 2);
+		for (size_t i = 0; i < out.size(); i++) out[i] = s[i] / 32768.0f;
+	} else {
+		const uint8_t* s = (const uint8_t*)data;
+		out.resize(size_in_bytes);
+		for (size_t i = 0; i < out.size(); i++) out[i] = (int(s[i]) - 128) / 128.0f;
+	}
+	return out;
+}
+// A whole wav file around the samples, as speak_to_file and speak_to_memory give back.
+static string tts_to_wav(const void* data, unsigned int size_in_bytes, unsigned int sample_rate, unsigned int channels, unsigned int bitsize) {
+	string out(44 + size_in_bytes, '\0');
+	char* p = &out[0];
+	auto put32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; i++) p[at + i] = char((v >> (i * 8)) & 0xff); };
+	auto put16 = [&](size_t at, uint16_t v) { p[at] = char(v & 0xff); p[at + 1] = char(v >> 8); };
+	memcpy(p, "RIFF", 4);
+	put32(4, 36 + size_in_bytes);
+	memcpy(p + 8, "WAVEfmt ", 8);
+	put32(16, 16);
+	put16(20, 1); // PCM
+	put16(22, uint16_t(channels));
+	put32(24, sample_rate);
+	put32(28, sample_rate * channels * (bitsize / 8));
+	put16(32, uint16_t(channels * (bitsize / 8)));
+	put16(34, uint16_t(bitsize));
+	memcpy(p + 36, "data", 4);
+	put32(40, size_in_bytes);
+	memcpy(p + 44, data, size_in_bytes);
+	return out;
 }
 
 tts_audio_data::tts_audio_data(tts_engine* eng, void* dat, unsigned int size, unsigned int rate, unsigned int chans, unsigned int bits, void* ctx) : engine(eng), data(dat), size_in_bytes(size), sample_rate(rate), channels(chans), bitsize(bits), context(ctx) {}
@@ -139,7 +177,6 @@ static void register_builtin_engines() {
 // tts_voice implementation
 tts_voice::tts_voice(const string &engine_list) : RefCount(1), current_voice_index(-1) {
 	if (engine_registry.empty()) register_builtin_engines();
-	speaking.clear();
 	vector<string> engine_names;
 	if (engine_list.empty()) engine_names = tts_get_engine_names();
 	else {
@@ -151,6 +188,12 @@ tts_voice::tts_voice(const string &engine_list) : RefCount(1), current_voice_ind
 		if (engine) engines.push_back(engine);
 	}
 	refresh();
+}
+tts_voice::~tts_voice() {
+	if (output) {
+		output->close();
+		output->release();
+	}
 }
 void tts_voice::AddRef() { asAtomicInc(RefCount); }
 void tts_voice::Release() { if (asAtomicDec(RefCount) < 1) delete this; }
@@ -172,14 +215,9 @@ bool tts_voice::speak(const string &text, bool interrupt) {
 		tts_audio_data* datablock = nullptr;
 		void *trimmed_data = speak_to_pcm(text, &datablock);
 		if (!trimmed_data || !datablock) return false;
-		soundptr s(new_global_sound());
-		ma_format format = (datablock->bitsize == 16) ? ma_format_s16 : ma_format_u8;
-		if (!s->load_pcm(trimmed_data, datablock->size_in_bytes, format, datablock->sample_rate, datablock->channels)) {
-			datablock->free();
-			return false;
-		}
+		bool r = schedule(datablock, trimmed_data, interrupt);
 		datablock->free();
-		return schedule(s, interrupt);
+		return r;
 	} else return voice->engine->speak(text, interrupt, false);
 }
 bool tts_voice::speak_to_file(const string &filename, const string &text) {
@@ -187,13 +225,7 @@ bool tts_voice::speak_to_file(const string &filename, const string &text) {
 	void *trimmed_data = speak_to_pcm(text, &datablock);
 	if (!trimmed_data || !datablock) return false;
 	try {
-		string output;
-		output.resize(datablock->size_in_bytes + 44);
-		ma_format format = (datablock->bitsize == 16)? ma_format_s16 : ma_format_u8;
-		if (!sound::pcm_to_wav(trimmed_data, datablock->size_in_bytes, format, datablock->sample_rate, datablock->channels, &output[0])) {
-			datablock->free();
-			return false;
-		}
+		string output = tts_to_wav(trimmed_data, datablock->size_in_bytes, datablock->sample_rate, datablock->channels, datablock->bitsize);
 		Poco::FileOutputStream file(filename, ios::binary);
 		file.write(output.data(), output.size());
 		file.close();
@@ -208,13 +240,7 @@ string tts_voice::speak_to_memory(const string &text) {
 	tts_audio_data* datablock;
 	void *trimmed_data = speak_to_pcm(text, &datablock);
 	if (!trimmed_data || !datablock) return "";
-	string output;
-	output.resize(datablock->size_in_bytes + 44);
-	ma_format format = (datablock->bitsize == 16)? ma_format_s16 : ma_format_u8;
-	if (!sound::pcm_to_wav(trimmed_data, datablock->size_in_bytes, format, datablock->sample_rate, datablock->channels, &output[0])) {
-		datablock->free();
-		return "";
-	}
+	string output = tts_to_wav(trimmed_data, datablock->size_in_bytes, datablock->sample_rate, datablock->channels, datablock->bitsize);
 	datablock->free();
 	return output;
 }
@@ -227,18 +253,18 @@ bool tts_voice::speak_wait(const string &text, bool interrupt) {
 		return true;
 	} else return voice->engine->speak(text, interrupt, true);
 }
-sound *tts_voice::speak_to_sound(const string &text) {
+nvsound::sound *tts_voice::speak_to_sound(const string &text) {
 	tts_audio_data* datablock;
 	void *trimmed_data = speak_to_pcm(text, &datablock);
 	if (!trimmed_data || !datablock) return nullptr;
-	sound *s = new_global_sound();
-	ma_format format = (datablock->bitsize == 16)? ma_format_s16 : ma_format_u8;
-	if (!s->load_pcm(trimmed_data, datablock->size_in_bytes, format, datablock->sample_rate, datablock->channels)) {
-		datablock->free();
+	vector<float> samples = tts_to_float(trimmed_data, datablock->size_in_bytes, datablock->bitsize);
+	nvsound::sound *s = nvsound::make_sound();
+	bool loaded = s->load_pcm(samples.data(), samples.size() / datablock->channels, datablock->sample_rate, datablock->channels, "tts");
+	datablock->free();
+	if (!loaded) {
 		s->release();
 		return nullptr;
 	}
-	datablock->free();
 	return s;
 }
 float tts_voice::get_rate() {
@@ -321,7 +347,7 @@ bool tts_voice::set_voice(int voice) {
 bool tts_voice::get_speaking() {
 	voice_info *voice = get_voice_info(current_voice_index);
 	if (!voice) return false;
-	if (voice->engine->get_pcm_generation_state() == PCM_PREFERRED) return speaking.test();
+	if (voice->engine->get_pcm_generation_state() == PCM_PREFERRED) return queue && nvsound::pcm_push_queued(queue.get()) > 0;
 	else return voice->engine->is_speaking();
 }
 bool tts_voice::refresh() {
@@ -361,8 +387,7 @@ bool tts_voice::stop() {
 	voice_info *voice = get_voice_info(current_voice_index);
 	if (!voice) return false;
 	if (voice->engine->get_pcm_generation_state() == PCM_PREFERRED) {
-		unique_lock<mutex> lock(queue_mtx);
-		clear();
+		if (queue) nvsound::pcm_push_clear(queue.get(), nvsound::get_sample_rate() / 50); // A 20 ms fade, as speech was always stopped with.
 		return true;
 	} else return voice->engine->stop();
 }
@@ -386,55 +411,36 @@ bool tts_voice::set_language(const string& language) {
 }
 string tts_voice::get_language() { return current_language; }
 
-bool tts_voice::schedule(soundptr &s, bool interrupt) {
-	try {
-		cleanup_completed_fades();
-		ma_sound_set_end_callback(s->get_ma_sound(), at_end, this);
-		unique_lock<mutex> lock(queue_mtx);
-		if (interrupt) clear();
-		queue.push(s);
-		speaking.test_and_set();
-		if (queue.size() == 1) s->play();
-		return true;
-	} catch (exception &) { return false; }
-}
-void tts_voice::clear() {
-	if (!queue.empty() && queue.front()->get_playing()) fade(queue.front());
-	while (!queue.empty()) queue.pop();
-	speaking.clear();
-}
-bool tts_voice::fade(soundptr &item) {
-	ma_sound_set_fade_in_milliseconds(item->get_ma_sound(), -1, 0, 20);
-	try {
-		fade_queue.push(item);
-		return true;
-	} catch (const exception &) { return false; }
-}
-void tts_voice::cleanup_completed_fades() {
-	if (fade_queue.empty()) return;
-	if ((fade_queue.front()->get_playing() && fade_queue.front()->get_current_fade_volume() > 0)) return;
-	while (!fade_queue.empty() && fade_queue.front()->is_load_completed()) fade_queue.pop();
-}
-void tts_voice::at_end(void *pUserData, ma_sound *pSound) {
-	tts_voice *voice = static_cast<tts_voice *>(pUserData);
-	ma_job job = ma_job_init(MA_JOB_TYPE_CUSTOM);
-	job.data.custom.data0 = (ma_uintptr)voice;
-	job.data.custom.data1 = (ma_uintptr)pSound;
-	job.data.custom.proc = job_proc;
-	ma_resource_manager_post_job(g_audio_engine->get_ma_engine()->pResourceManager, &job);
-}
-ma_result tts_voice::job_proc(ma_job *pJob) {
-	tts_voice *voice = (tts_voice *)pJob->data.custom.data0;
-	ma_sound *expected_front = (ma_sound *)pJob->data.custom.data1;
-	unique_lock<mutex> lock(voice->queue_mtx);
-	if (voice->queue.empty() || voice->queue.front()->get_ma_sound() != expected_front) return MA_CANCELLED;
-	voice->queue.pop();
-	if (voice->queue.size() == 0) {
-		voice->speaking.clear();
-		return MA_SUCCESS;
+// Converts an utterance to the engine's rate in stereo and pushes it onto the voice's sound, after whatever is still being said unless interrupting.
+bool tts_voice::schedule(tts_audio_data* datablock, void* samples, bool interrupt) {
+	if (!nvsound::init() || datablock->channels < 1) return false;
+	unsigned int rate = nvsound::get_sample_rate();
+	if (!output) {
+		queue = nvsound::make_pcm_push_source(rate, 2);
+		output = nvsound::make_sound();
+		if (!output->load_source(nvsound::as_source(queue), "")) {
+			output->release();
+			output = nullptr;
+			queue.reset();
+			return false;
+		}
 	}
-	voice->queue.front()->play();
-	return MA_SUCCESS;
+	vector<float> in = tts_to_float(samples, datablock->size_in_bytes, datablock->bitsize);
+	uint64_t frames = in.size() / datablock->channels;
+	if (datablock->sample_rate != rate) {
+		vector<float> resampled = nvsound::resample_interleaved(in.data(), frames, datablock->channels, datablock->sample_rate, rate, frames);
+		in.swap(resampled);
+	}
+	vector<float> stereo(frames * 2);
+	for (uint64_t f = 0; f < frames; f++) {
+		const float* s = &in[f * datablock->channels];
+		stereo[f * 2] = s[0];
+		stereo[f * 2 + 1] = datablock->channels > 1 ? s[1] : s[0];
+	}
+	if (interrupt) nvsound::pcm_push_clear(queue.get(), rate / 50);
+	nvsound::pcm_push(queue.get(), stereo.data(), stereo.size());
+	if (!output->is_playing()) output->play();
+	return true;
 }
 
 CScriptArray *tts_get_engines() {

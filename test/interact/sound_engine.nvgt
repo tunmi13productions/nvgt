@@ -1,0 +1,176 @@
+// NonVisual Gaming Toolkit (NVGT)
+// Copyright (C) 2022-2025 Sam Tupy
+// License: zlib (see license.md in the root of the NVGT distribution)
+
+// Listening test for the sound engine. Run it from anywhere; it finds the test data itself.
+// 1-6 play the same clip as ogg, wav, mp3, flac, opus and 22 kHz mono wav; they should all sound identical.
+// 7 loops 441.ogg (25 seconds of music) through load, 8 through stream; they should sound identical. j jumps the music ahead 5 seconds, s stops everything playing on the clip or music.
+// p slides the clip's pan from left to right, h slides its pitch from 50 to 200 percent.
+// l starts or stops a looping stream that circles you using the legacy set_position math; arrows move you.
+// g fades a two sound mixer out and back in, m reports the microphone's format and loudness, escape quits.
+// t turns Steam Audio HRTF on or off for the circling stream; compare the two while it goes round you.
+// v moves the music into a sound_environment: open space, then a concrete room, then the same room with a wall between you and it, then back out.
+// i puts the clip and music through a convolution reverb (a synthesized small hall), then the same with the tail centred, then off.
+// e steps through set_fx presets on the clip and music (try 7 first), shift+e clears them.
+const string[] fx_names = {"lowpass at 600 hertz", "highpass at 2 kilohertz", "bandpass at 1 kilohertz", "freeverb, big room", "plate reverb", "DirectX reverb, 2.5 seconds", "I3DL2 reverb with predelay", "rotate once a second", "volume to minus 20 decibels", "echo, crossing sides", "flanger", "exaggerated chorus", "phaser", "slow autowah", "hard distortion", "compressor", "pitch up 4 semitones", "pitch an octave down"};
+const string[] fx_strings = {"lowpass:600:0:0.7", "highpass:2000:0:0.7", "bandpass:1000:1:0", "freeverb:1:0.8:0.85:0.4:1", "plate:1:0.5:1.4:0.75:0.3:1:0.02", "reverb:0:-6:2500:0.4", "i3DL2reverb:-1000:-100:0:2.5:0.8:-1500:0.03:0:0.05:100:100:5000", "rotate:1", "volume:0.8", "echo4:1:0.6:0.45:0.3:1", "chorus:1:0.35:0.5:1:5:1", "chorus:0.7:0.25:0.5:1:200:50", "phaser:0.999:0.999:0:1:4:100", "autowah:0.5:1.5:0.5:2:4.3:50", "distortion:1:0:1:0:1", "compressor2:8:-24:4:5:200", "pitchshift:1:4", "pitchshift:0.5"};
+const string[] formats = {"data/audio/yfs.ogg", "data/audio/yfs.wav", "data/audio/yfs.mp3", "data/audio/yfs.flac", "data/audio/yfs.opus", "data/audio/yfs_mono22k.wav"};
+
+void main() {
+	// The test data lives in test/data, so work from the test directory wherever this was launched from.
+	if (!directory_exists("data/audio")) chdir(spec::path(SCRIPT_CURRENT_FILE).make_parent().make_parent());
+	show_window("sound engine test");
+	sound clip;
+	sound music;
+	sound orbit;
+	mixer group;
+	sound group_a, group_b;
+	group_a.set_mixer(group);
+	group_b.set_mixer(group);
+	group_a.load("data/audio/sonar.ogg");
+	group_b.load("data/audio/points.ogg");
+	microphone@ mic = null;
+	int fx_index = -1;
+	bool orbit_hrtf = false;
+	sound_environment@ env = null;
+	sound@ env_music = null;
+	int env_stage = 0;
+	mixer ir_mixer;
+	clip.set_mixer(ir_mixer);
+	music.set_mixer(ir_mixer);
+	int ir_stage = 0;
+	float lx = 0, ly = 0, angle = 0;
+	timer orbit_clock;
+	screen_reader_speak("ready, output device " + sound_output_devices[sound_output_device]);
+	while (!key_pressed(KEY_ESCAPE)) {
+		wait(5);
+		for (int i = 0; i < 6; i++) {
+			if (!key_pressed(KEY_1 + i)) continue;
+			if (clip.load(formats[i])) clip.play();
+			else screen_reader_speak("could not open " + formats[i] + " from " + cwdir());
+		}
+		if (key_pressed(KEY_P)) {
+			clip.load(formats[0]);
+			clip.pan = -100;
+			clip.play_looped();
+			clip.slide_pan(100, 3000);
+		}
+		if (key_pressed(KEY_H)) {
+			clip.load(formats[0]);
+			clip.pitch = 50;
+			clip.play_looped();
+			clip.slide_pitch(200, 3000);
+		}
+		if (key_pressed(KEY_7) || key_pressed(KEY_8)) {
+			bool streaming = key_pressed(KEY_8);
+			if (streaming ? music.stream("data/audio/441.ogg") : music.load("data/audio/441.ogg")) {
+				music.play_looped();
+				screen_reader_speak((streaming ? "streaming" : "loaded") + ", " + round(music.length / 1000, 1) + " seconds");
+			} else screen_reader_speak("could not open data/audio/441.ogg from " + cwdir());
+		}
+		if (key_pressed(KEY_J) && music.playing) {
+			float target = music.position + 5000;
+			if (target >= music.length) target = 0;
+			music.seek(target);
+			screen_reader_speak(round(target / 1000, 0) + " seconds");
+		}
+		if (key_pressed(KEY_E)) {
+			bool clear = key_down(KEY_LSHIFT) || key_down(KEY_RSHIFT);
+			fx_index = clear ? -1 : (fx_index + 1) % fx_strings.length();
+			clip.set_fx("$preset");
+			music.set_fx("$preset");
+			if (clear) screen_reader_speak("effects off");
+			else {
+				clip.set_fx("$preset:" + fx_strings[fx_index]);
+				music.set_fx("$preset:" + fx_strings[fx_index]);
+				screen_reader_speak(fx_names[fx_index]);
+			}
+		}
+		if (key_pressed(KEY_S)) {
+			clip.stop();
+			music.stop();
+		}
+		if (key_pressed(KEY_L)) {
+			if (orbit.playing) orbit.stop();
+			else if (orbit.stream("data/audio/yfs_mono22k.wav")) orbit.play_looped();
+		}
+		if (key_pressed(KEY_T)) {
+			sound_global_hrtf = true;
+			orbit_hrtf = !orbit_hrtf;
+			orbit.set_hrtf(orbit_hrtf);
+			screen_reader_speak(orbit_hrtf ? "HRTF on" : "HRTF off");
+		}
+		if (key_pressed(KEY_I)) {
+			// The sedan response isn't in the repository, so its stage is skipped where it hasn't been copied in.
+			ir_stage = (ir_stage + 1) % (file_exists("data/audio/sedan_speakers_front.wav") ? 4 : 3);
+			if (ir_stage == 0) ir_mixer.set_impulse_response("");
+			// Responses aren't scaled on load, so wet has to make up for how loud each one is: the sedan's peaks at about +15 dB, so it plays wet only at 0.3.
+			else if (ir_stage == 3) ir_mixer.set_impulse_response("data/audio/sedan_speakers_front.wav", 0.0, 0.3);
+			else ir_mixer.set_impulse_response("data/audio/hall_ir.wav", 1.0, 0.5, "", ir_stage == 1 ? 1.0 : 0.0);
+			string[] stages = {"convolution reverb off", "convolution reverb, following the pan", "convolution reverb, centred", "through the front speakers of a sedan"};
+			screen_reader_speak(stages[ir_stage]);
+		}
+		if (key_pressed(KEY_V)) {
+			env_stage = (env_stage + 1) % 4;
+			@env_music = null;
+			@env = null;
+			if (env_stage > 0) {
+				@env = sound_environment();
+				env.set_listener(0, 0, 0, 0);
+				if (env_stage >= 2) { // Six concrete slabs around both of you.
+					env.add_box("concrete", -9, 9, -9, 9, -10, -9);
+					env.add_box("concrete", -9, 9, -9, 9, 9, 10);
+					env.add_box("concrete", -10, -9, -9, 9, -9, 9);
+					env.add_box("concrete", 9, 10, -9, 9, -9, 9);
+					env.add_box("concrete", -9, 9, -10, -9, -9, 9);
+					env.add_box("concrete", -9, 9, 9, 10, -9, 9);
+				}
+				if (env_stage == 3) env.add_box("wood", 1.5, 2, -9, 9, -9, 9);
+				@env_music = env.new_sound();
+				env_music.stream("data/audio/441.ogg");
+				env_music.set_position(0, 0, 0, 4, 3, 0);
+				env_music.play_looped();
+			}
+			string[] stages = {"environment off", "open space", "concrete room", "concrete room, wooden wall between you"};
+			screen_reader_speak(stages[env_stage]);
+		}
+		if (key_down(KEY_LEFT)) lx -= 0.05;
+		if (key_down(KEY_RIGHT)) lx += 0.05;
+		if (key_down(KEY_UP)) ly += 0.05;
+		if (key_down(KEY_DOWN)) ly -= 0.05;
+		if (orbit.playing) {
+			angle += orbit_clock.elapsed / 1000.0;
+			orbit_clock.restart();
+			orbit.set_position(lx, ly, 0, cos(angle) * 15, sin(angle) * 15, 0);
+		}
+		if (key_pressed(KEY_G)) {
+			group_a.play_looped();
+			group_b.play_looped();
+			group.volume = 0;
+			group.slide_volume(-60, 2000);
+		}
+		if (group.volume <= -60 && !group.volume_sliding) group.slide_volume(0, 2000);
+		if (key_pressed(KEY_X)) {
+			group_a.stop();
+			group_b.stop();
+		}
+		if (key_pressed(KEY_M)) {
+			if (@mic == null) {
+				try {
+					@mic = microphone();
+				} catch {
+					screen_reader_speak("no microphone: " + get_exception_info());
+					continue;
+				}
+				screen_reader_speak("microphone open at " + mic.sample_rate + " hertz, " + mic.channels + " channels. Speak, then press m again.");
+				continue;
+			}
+			float[]@ frames = mic.read();
+			float peak = 0;
+			for (uint i = 0; i < frames.length(); i++) {
+				if (abs(frames[i]) > peak) peak = abs(frames[i]);
+			}
+			screen_reader_speak(frames.length() / mic.channels + " frames, peak " + round(peak * 100, 0) + " percent");
+		}
+	}
+}

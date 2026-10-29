@@ -3,7 +3,6 @@
  * This wraps a C implementation I made during September 2024.
  * It's my first dive into low level synthesis and processing (yes, with the help of AI) so it's probably not ideal.
  * It's certainly slower than I'd like, but it gets the feature started and working until a better implementation can be found.
- * Todo: Since we're already using MiniAudio, discover how we might use ma_waveform for this, though not sure how much anti-aliasing it has.
  *
  * NVGT - NonVisual Gaming Toolkit
  * Copyright (c) 2022-2025 Sam Tupy
@@ -19,7 +18,8 @@
 #include <angelscript.h>
 #include <scriptarray.h>
 #include <Poco/Format.h>
-#include "sound.h"
+#include <vector>
+#include "nvsound.h"
 #include "nvgt.h" // g_ScriptEngine
 #include "nvgt_angelscript.h" // get_system_namespace
 
@@ -152,23 +152,15 @@ int tone_synth::get_sample_rate() {
 int tone_synth::get_channels() {
 	return el_tonar_get_channels(gen);
 }
-sound* tone_synth::generate_sound() {
-init_sound();
+nvsound::sound* tone_synth::generate_sound() {
 	int size = el_tonar_output_buffer_size(gen);
-	if (size <= 0) return nullptr;
-	char* buffer = new char[size];
-	if (!buffer) return nullptr;
-	if (!el_tonar_output_buffer(gen, buffer, size)) {
-		delete[] buffer;
-		return nullptr;
-	}
-	sound *s = g_audio_engine->new_sound();
-	if (!s) {
-		delete[] buffer;
-		return nullptr;
-	}
-	bool loaded = s->load_pcm(buffer, static_cast<unsigned int>(size), ma_format_s16, gen->sample_rate, gen->channels);
-	delete[] buffer;
+	if (size <= 0 || gen->channels < 1) return nullptr;
+	std::vector<int16_t> buffer(size / sizeof(int16_t)); // The output is 16 bit samples.
+	if (!el_tonar_output_buffer(gen, (char*)buffer.data(), size)) return nullptr;
+	std::vector<float> samples(buffer.size());
+	for (size_t i = 0; i < buffer.size(); i++) samples[i] = buffer[i] / 32768.0f;
+	nvsound::sound *s = nvsound::make_sound();
+	bool loaded = s->load_pcm(samples.data(), samples.size() / gen->channels, gen->sample_rate, gen->channels, "tone_synth");
 	if (!loaded) {
 		s->release(); // Sound object is not passed to the script if load fails, delete it.
 		return nullptr;

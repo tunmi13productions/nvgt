@@ -51,7 +51,6 @@
 #include "random.h"    // random_seed()
 #include "random_interface.h"    // cleanup_default_random()
 #include "serialize.h" // current location of g_StringTypeid (subject to change)
-#include "sound.h"
 #include "nvsound.h"
 #include "tts.h"
 #include "UI.h" // message
@@ -377,7 +376,6 @@ protected:
 		// Before InputDestroy, which calls SDL_Quit and frees every SDL audio stream out from under the sound engine.
 		nvsound::shutdown();
 		InputDestroy();
-		uninit_sound();
 		anticheat_deinit();
 		cleanup_default_random();
 		if (crash_handler_pending()) {

@@ -1,0 +1,538 @@
+// Tests for the sound engine: SDL3 output, our own decoders and mixer tree, and Steam Audio for 3D.
+// Every yfs file is the same 1.634 second clip in a different format.
+const string[] sound_test_formats = {"data/audio/yfs.ogg", "data/audio/yfs.wav", "data/audio/yfs.mp3", "data/audio/yfs.flac", "data/audio/yfs.opus", "data/audio/yfs_mono22k.wav"};
+
+void test_sound_decodes_every_format() {
+	for (uint i = 0; i < sound_test_formats.length(); i++) {
+		sound s;
+		assert(s.load(sound_test_formats[i]), "load " + sound_test_formats[i]);
+		assert(s.loaded_filename == sound_test_formats[i]);
+		assert(abs(s.length - 1634) < 60, sound_test_formats[i] + " length " + s.length);
+		sound st;
+		assert(st.stream(sound_test_formats[i]), "stream " + sound_test_formats[i]);
+		assert(abs(st.length - 1634) < 60, "streamed " + sound_test_formats[i] + " length " + st.length);
+	}
+}
+
+// 441.ogg is 25.25 seconds of 48 kHz stereo music: load decodes it all, stream decodes it on the feeder thread.
+void test_sound_music_load_and_stream_agree() {
+	sound loaded, streamed;
+	assert(loaded.load("data/audio/441.ogg"));
+	assert(streamed.stream("data/audio/441.ogg"));
+	assert(abs(loaded.length - 25254) < 30, "loaded length " + loaded.length);
+	assert(abs(streamed.length - 25254) < 30, "streamed length " + streamed.length);
+	assert(loaded.seek(20000) && streamed.seek(20000));
+	assert(abs(loaded.position - 20000) < 30, "loaded position " + loaded.position);
+	assert(abs(streamed.position - 20000) < 30, "streamed position " + streamed.position);
+	assert(!streamed.seek(-5));
+}
+
+void test_sound_music_stream_loops_through_the_end() {
+	if (!SOUND_AVAILABLE) return;
+	mixer m;
+	m.volume = -100;
+	sound s;
+	assert(s.set_mixer(m));
+	assert(s.stream("data/audio/441.ogg"));
+	assert(s.play_looped());
+	assert(s.seek(24500)); // Three quarters of a second from the end.
+	wait(1500);
+	assert(s.playing, "looped music stopped at the end");
+	assert(s.position < 2000, "position after wrapping " + s.position);
+	assert(s.pause());
+	float paused_at = s.position;
+	wait(300);
+	assert(abs(s.position - paused_at) < 1, "position moved while paused");
+}
+
+void test_sound_rejects_missing_and_garbage() {
+	sound s;
+	assert(!s.load("data/audio/does_not_exist.ogg"));
+	assert(!s.stream("data/audio/does_not_exist.ogg"));
+	assert(!s.active);
+	file f;
+	f.open("tmp/sound_garbage.bin", "wb");
+	f.write("this is not audio, and no decoder should claim that it is.");
+	f.close();
+	assert(!s.load("tmp/sound_garbage.bin"));
+}
+
+void test_sound_play_state() {
+	sound s;
+	assert(!s.play()); // Nothing loaded.
+	assert(s.load("data/audio/yfs.ogg"));
+	assert(s.active);
+	assert(s.paused); // A freshly loaded sound sits paused in its mixer, as under BASS.
+	assert(!s.playing);
+	assert(s.play());
+	assert(s.playing && !s.paused);
+	assert(!s.play()); // Already playing.
+	assert(s.pause());
+	assert(!s.playing && s.paused);
+	assert(!s.pause()); // Already paused.
+	assert(s.seek(800));
+	assert(abs(s.position - 800) < 5);
+	assert(s.stop());
+	assert(s.position == 0);
+	assert(s.close());
+	assert(!s.active && s.loaded_filename == "");
+	assert(!s.close());
+}
+
+void test_sound_parameter_ranges() {
+	sound s;
+	assert(s.load("data/audio/yfs.ogg"));
+	s.volume = 5;
+	assert(s.volume == 0); // Volume clamps to -100..0 like the legacy engine.
+	s.volume = -150;
+	assert(s.volume == -100);
+	assert(!s.slide_volume(-101, 100));
+	s.pan = 40;
+	s.pan = 150; // Out of range, ignored.
+	assert(s.pan == 40);
+	s.pitch = 200;
+	s.pitch = 1; // Below the 5 percent floor, ignored.
+	assert(s.pitch == 200);
+	assert(!s.slide_pitch(600, 100));
+	assert(s.slide_pan(-40, 100000));
+	assert(s.pan_sliding && s.sliding && !s.volume_sliding);
+}
+
+void test_mixer_tree_refuses_cycles() {
+	mixer a, b, c;
+	assert(b.set_mixer(a));
+	assert(c.set_mixer(b));
+	assert(!a.set_mixer(c)); // c is inside a.
+	assert(!a.set_mixer(a));
+	assert(a.set_mixer(null)); // Back to the master.
+	sound s;
+	assert(s.set_mixer(c));
+	assert(s.load("data/audio/yfs.ogg"));
+	assert(s.active);
+}
+
+void test_sound_plays_through_device() {
+	if (!SOUND_AVAILABLE) return; // Nothing to drive the clock on a machine without an output device.
+	mixer m;
+	m.volume = -100; // Silent, this only checks that time passes.
+	sound s;
+	assert(s.set_mixer(m));
+	assert(s.load("data/audio/yfs.ogg"));
+	assert(s.play());
+	wait(300);
+	assert(s.position > 150, "position " + s.position);
+	timer t;
+	while (s.playing && t.elapsed < 4000) wait(10);
+	assert(!s.playing, "sound never finished");
+	assert(!s.paused); // It ended rather than being paused.
+	assert(s.play()); // Playing an ended sound starts it over.
+	assert(s.position < 300);
+	s.stop();
+	sound looped;
+	assert(looped.set_mixer(m));
+	assert(looped.stream("data/audio/yfs_mono22k.wav"));
+	assert(looped.play_looped());
+	wait(2200); // Past the end of the clip.
+	assert(looped.playing, "looped stream stopped");
+	sound fast;
+	assert(fast.set_mixer(m));
+	assert(fast.load("data/audio/yfs.wav"));
+	fast.pitch = 400;
+	assert(fast.play());
+	t.restart();
+	while (fast.playing && t.elapsed < 4000) wait(10);
+	assert(t.elapsed < 1000, "pitch 400 took " + t.elapsed + "ms to play 1634ms of audio");
+}
+
+// Data sources: packs, memory, script callbacks and pushed audio.
+string sound_test_read_file(const string&in path) {
+	file f;
+	if (!f.open(path, "rb")) return "";
+	string data = f.read();
+	f.close();
+	return data;
+}
+
+void test_sound_legacy_pack() {
+	pack p;
+	assert(p.open("tmp/sound_legacy_pack.dat", PACK_OPEN_MODE_CREATE));
+	assert(p.add_file("data/audio/yfs.ogg", "yfs.ogg"));
+	assert(p.add_file("data/audio/441.ogg", "music.ogg"));
+	assert(p.close());
+	assert(p.open("tmp/sound_legacy_pack.dat", PACK_OPEN_MODE_READ));
+	sound s;
+	assert(s.load("yfs.ogg", p));
+	assert(abs(s.length - 1634) < 60, "length " + s.length);
+	assert(s.stream("music.ogg", p)); // Long enough to stream rather than decode.
+	assert(abs(s.length - 25254) < 30, "streamed from pack " + s.length);
+	assert(!s.load("missing.ogg", p));
+	@sound_default_pack = p;
+	assert(s.load("yfs.ogg")); // Picked up from the default pack.
+	assert(@sound_default_pack != null);
+	@sound_default_pack = null;
+	assert(!s.load("yfs.ogg")); // Not on disk.
+	assert(s.load("data/audio/yfs.ogg"));
+}
+
+void test_sound_modern_pack() {
+	pack_file p;
+	assert(p.create("tmp/sound_modern_pack.dat"));
+	assert(p.add_file("data/audio/yfs.wav", "yfs.wav"));
+	assert(p.close());
+	assert(p.open("tmp/sound_modern_pack.dat"));
+	sound s;
+	assert(s.load("yfs.wav", p));
+	assert(abs(s.length - 1634) < 60, "length " + s.length);
+	// The same name on disk is a different file and must not come back from the cache.
+	assert(!s.load("yfs.wav", null));
+}
+
+void test_sound_load_from_memory() {
+	string data = sound_test_read_file("data/audio/yfs.ogg");
+	assert(data.length() > 0);
+	sound s;
+	assert(s.load(data, data.length()));
+	assert(s.loaded_filename == "script_stream");
+	assert(abs(s.length - 1634) < 60);
+	string scrambled;
+	for (uint i = 0; i < data.length(); i++) scrambled += ascii_to_character(character_to_ascii(data[i]) + 27); // The inverse of the default sound_data_char_decrypt.
+	assert(scrambled.length() == data.length() && scrambled != data);
+	assert(s.load(scrambled, scrambled.length(), "scrambled.ogg", true));
+	assert(s.loaded_filename == "scrambled.ogg");
+	assert(abs(s.length - 1634) < 60);
+	assert(!s.load(scrambled, scrambled.length())); // Without decrypting it is noise.
+}
+
+string sound_callback_source;
+uint sound_callback_pos;
+bool sound_callback_closed;
+uint sound_cb_length(string user_data) { return sound_callback_source.length(); }
+int sound_cb_read(string &out data, uint length, string user_data) {
+	assert(user_data == "callback data");
+	data = sound_callback_source.substr(sound_callback_pos, length);
+	sound_callback_pos += data.length();
+	return data.length();
+}
+bool sound_cb_seek(uint offset, string user_data) {
+	sound_callback_pos = offset;
+	return true;
+}
+void sound_cb_close(string user_data) { sound_callback_closed = true; }
+void test_sound_load_from_callbacks() {
+	sound_callback_source = sound_test_read_file("data/audio/yfs.mp3");
+	sound_callback_pos = 0;
+	sound_callback_closed = false;
+	sound s;
+	assert(s.load(sound_cb_close, sound_cb_length, sound_cb_read, sound_cb_seek, "callback data"));
+	assert(sound_callback_closed);
+	assert(abs(s.length - 1634) < 60, "length " + s.length);
+}
+
+float[] sound_test_sine(int rate, int channels, float seconds) {
+	float[] samples(uint(rate * seconds) * channels);
+	for (uint i = 0; i < samples.length(); i++) samples[i] = sin(6.2832 * 440 * (i / channels) / rate) * 0.5;
+	return samples;
+}
+
+void test_sound_push_pcm() {
+	mixer m;
+	m.volume = -100;
+	sound s;
+	assert(s.set_mixer(m));
+	assert(!s.push_memory(sound_test_sine(24000, 1, 0.1))); // The first push must say what the samples are.
+	float[] half = sound_test_sine(24000, 1, 0.25);
+	assert(s.push_memory(half, false, 24000, 1));
+	assert(s.active && s.loaded_filename == "");
+	assert(abs(s.length - 250) < 5, "buffered " + s.length);
+	assert(s.push_memory(half)); // Later pushes keep the stream's format.
+	datastream ds; // The string form takes the same samples as raw 32 bit floats.
+	for (uint i = 0; i < half.length(); i++) ds.write_float(half[i]);
+	assert(s.push_memory(ds.str(), true));
+	assert(abs(s.length - 750) < 5, "buffered " + s.length);
+	if (!SOUND_AVAILABLE) return;
+	assert(s.play());
+	timer t;
+	while (s.playing && t.elapsed < 3000) wait(10);
+	assert(!s.playing, "a pushed stream that was ended never finished");
+	assert(t.elapsed > 600 && t.elapsed < 1200, "750ms of audio took " + t.elapsed + "ms");
+	sound open_ended;
+	assert(open_ended.set_mixer(m));
+	assert(open_ended.push_memory(half, false, 24000, 1));
+	assert(open_ended.play());
+	wait(500);
+	assert(open_ended.playing); // Ran dry but wasn't ended, so it waits for more.
+	assert(open_ended.push_memory(half, true));
+	t.restart();
+	while (open_ended.playing && t.elapsed < 2000) wait(10);
+	assert(!open_ended.playing);
+}
+
+void test_sound_push_encoded() {
+	string data = sound_test_read_file("data/audio/yfs.ogg");
+	sound s;
+	assert(!s.push_memory(data.substr(0, 500))); // Too little to recognise, as under BASS.
+	assert(s.push_memory(data.substr(0, 4096)));
+	for (uint pos = 4096; pos < data.length(); pos += 4096) assert(s.push_memory(data.substr(pos, 4096), pos + 4096 >= data.length()));
+	assert(s.active);
+	if (!SOUND_AVAILABLE) return;
+	mixer m;
+	m.volume = -100;
+	assert(s.set_mixer(m));
+	assert(s.play());
+	timer t;
+	while (s.playing && t.elapsed < 4000) wait(10);
+	assert(!s.playing, "pushed ogg never finished");
+	assert(t.elapsed > 1300, "1634ms of pushed ogg finished after " + t.elapsed + "ms");
+	assert(s.close());
+}
+
+// set_fx. The DSP itself is checked numerically outside the engine; these check the legacy rules and that effects run in the mix.
+void test_sound_set_fx_rules() {
+	sound s;
+	assert(s.load("data/audio/yfs.ogg"));
+	assert(s.set_fx("lowpass:1200:0:0.7"));
+	assert(!s.set_fx("lowpass:1200:0")); // Too few parameters.
+	assert(!s.set_fx("flanger:0.5:0.002")); // Not an effect.
+	assert(!s.set_fx(":::")); // Nothing but separators.
+	assert(s.set_fx("$muffle:lowpass:800:0:0.7"));
+	assert(s.set_fx("$muffle:highpass:200:0:0.7")); // Same id, same family: changed in place.
+	assert(!s.set_fx("$muffle:freeverb:0:1:0.5:0.5:1")); // Same id, different type.
+	assert(s.set_fx("$room_a:freeverb:1:0.5:0.5:0.5:1"));
+	assert(s.set_fx("$room_b:plate:1:0.3:1:0.6:0.4"));
+	assert(s.set_fx("$room")); // Prefix removal takes both rooms.
+	assert(!s.set_fx("$room_a:lowpass:800:0")); // Proves the id is free again only if the effect itself is valid.
+	assert(s.set_fx("$room_a:volume:0.9", 0)); // Inserted at the front.
+	assert(s.set_fx("", 0)); // Removes it.
+	assert(!s.set_fx("", 50)); // No such index.
+	assert(s.set_fx("")); // Clears everything.
+	assert(s.set_fx("$x:volume:1"));
+}
+
+void test_sound_effects_in_the_mix() {
+	mixer m;
+	m.volume = -100;
+	assert(m.set_fx("$verb:freeverb:1:0.5:0.6:0.5:1"));
+	assert(m.set_fx("i3DL2reverb:-1000:-100:0:1.49:0.83:-2602:0.007:200:0.011:100:100:5000"));
+	assert(m.set_fx("reverb:0:-10:1200:0.5"));
+	assert(m.set_fx("damp:0.8:0.01:0.3:1:0.5"));
+	sound s;
+	assert(s.set_mixer(m));
+	assert(s.load("data/audio/yfs.wav"));
+	assert(s.set_fx("$f:bandpass:1000:2:0"));
+	assert(s.set_fx("rotate:0.5"));
+	assert(s.set_fx("lvolume:0.8"));
+	assert(s.set_fx("plate:1:0.4:1.2:0.7:0.3:1:0.02"));
+	// The rest of the BASS_FX effects, in its own preset values.
+	assert(s.set_fx("echo4:1:0.5:0.4:0.15:1"));
+	assert(s.set_fx("chorus:1:0.35:0.5:1:5:1"));
+	assert(s.set_fx("phaser:0.999:0.999:0:1:4:100"));
+	assert(s.set_fx("$w:autowah:0.5:1.5:0.5:2:4.3:50"));
+	assert(s.set_fx("distortion:0.2:0.96:0.03:0.1:1"));
+	assert(s.set_fx("compressor2:5:-15:3:10:300"));
+	assert(s.set_fx("$p:pitchshift:1:3"));
+	assert(!s.set_fx("echo4:1:0.5:0.4:0.15")); // Each still needs its legacy parameter count.
+	assert(!s.set_fx("$p:chorus:1:0.35:0.5:1:5:1")); // $p is a pitchshift.
+	if (!SOUND_AVAILABLE) return;
+	assert(s.play());
+	wait(200);
+	for (int i = 0; i < 20; i++) {
+		assert(s.set_fx("$f:bandpass:" + (500 + i * 100) + ":2:0")); // Adjusting a running filter, as games do every frame.
+		assert(s.set_fx("$p:pitchshift:" + (0.8 + i * 0.02))); // And a running pitch shift.
+	}
+	timer t;
+	while (s.playing && t.elapsed < 4000) wait(10);
+	assert(!s.playing, "a sound with effects never finished");
+	assert(m.set_fx(""));
+}
+
+// Steam Audio. HRTF placement is checked numerically outside the engine; this checks it runs in the mix.
+void test_sound_hrtf_plays() {
+	if (!SOUND_AVAILABLE) return;
+	sound_global_hrtf = true;
+	assert(sound_global_hrtf);
+	mixer m;
+	m.volume = -100;
+	sound s;
+	assert(s.set_mixer(m));
+	assert(s.load("data/audio/yfs.wav"));
+	s.set_hrtf(true);
+	assert(s.set_position(0, 0, 0, 5, 3, 0));
+	assert(s.play());
+	timer t;
+	for (int i = 0; s.playing && t.elapsed < 4000; i++) {
+		s.set_position(0, 0, 0, cos(i * 0.1) * 5, sin(i * 0.1) * 5, 0, i * 0.05); // Moving and turning while it plays.
+		wait(10);
+	}
+	assert(!s.playing, "an HRTF sound never finished");
+	mixer positioned; // Mixers can be placed too.
+	assert(positioned.set_mixer(m));
+	positioned.set_hrtf(true);
+	assert(positioned.set_position(0, 0, 0, -4, 0, 0));
+	assert(s.set_mixer(positioned));
+	s.pitch = 150; // A pitched sound under an HRTF mixer.
+	assert(s.play());
+	t.restart();
+	while (s.playing && t.elapsed < 4000) wait(10);
+	assert(!s.playing);
+}
+
+// sound_environment. Occlusion, transmission and reflections are checked numerically against real Steam Audio scenes outside the engine; this checks the script side.
+void test_sound_environment() {
+	sound_environment env;
+	assert(sound_global_hrtf); // Turned on by creating an environment, as in the legacy engine.
+	assert(env.add_material("felt", 0.5, 0.6, 0.7, 0.05, 0.3, 0.2, 0.1));
+	assert(!env.add_material("felt", 0, 0, 0, 0, 0, 0, 0)); // Already there.
+	assert(env.add_material("felt", 0, 0, 0, 0, 0, 0, 0, true)); // Unless asked to replace it.
+	assert(env.add_box("concrete", -10, 10, -10, 10, -1, 0)); // A floor.
+	assert(!env.add_box("unobtainium", 0, 1, 0, 1, 0, 1));
+	env.set_listener(0, 0, 0, 0);
+	sound@ s = env.new_sound();
+	assert(s !is null);
+	mixer@ m = env.new_mixer();
+	assert(m !is null);
+	if (!SOUND_AVAILABLE) return;
+	mixer quiet;
+	quiet.volume = -100;
+	assert(s.set_mixer(quiet));
+	assert(s.load("data/audio/yfs.wav"));
+	assert(s.set_position(0, 0, 0, 4, 2, 0));
+	assert(s.play());
+	timer t;
+	for (int i = 0; s.playing && t.elapsed < 4000; i++) {
+		env.set_listener(0, i * 0.01, 0, 0);
+		env.update();
+		wait(10);
+	}
+	assert(!s.playing, "a sound in an environment never finished");
+	@s = null; // Releasing sounds detaches them from the environment.
+	@m = null;
+}
+
+// set_impulse_response. The convolver is checked against direct convolution outside the engine; this checks the script side. hall_ir.wav is a synthesized 1.2 second stereo response.
+void test_sound_impulse_response() {
+	mixer m;
+	assert(m.set_impulse_response("data/audio/hall_ir.wav"));
+	assert(m.set_impulse_response("data/audio/hall_ir.wav", 1.0, 0.5, "data/audio/yfs.wav", 0.5)); // A second file makes it true stereo.
+	// A real recorded response, 24 bit at 44.1 kHz so it is resampled on load. It isn't in the repository, so this only runs where it has been copied in.
+	if (file_exists("data/audio/sedan_speakers_front.wav")) assert(m.set_impulse_response("data/audio/sedan_speakers_front.wav", 0.0, 0.3));
+	assert(!m.set_impulse_response("data/audio/no_such_response.wav"));
+	assert(!m.set_impulse_response("data/audio/hall_ir.wav", 1, 0.3, "data/audio/no_such_right.wav"));
+	assert(m.set_impulse_response_params(0.8, 0.4, 0.0)); // Centred tail.
+	set_impulse_response_quality(0.5, 2); // Cheaper responses from here on.
+	assert(m.set_impulse_response("data/audio/hall_ir.wav"));
+	set_impulse_response_quality(1.5, 3); // 3 isn't a power of two, so loading refuses it.
+	assert(!m.set_impulse_response("data/audio/hall_ir.wav"));
+	set_impulse_response_quality();
+	assert(m.set_impulse_response("data/audio/hall_ir.wav"));
+	if (SOUND_AVAILABLE) {
+		mixer quiet;
+		quiet.volume = -100;
+		assert(m.set_mixer(quiet));
+		sound s;
+		assert(s.set_mixer(m));
+		assert(s.load("data/audio/yfs.ogg"));
+		assert(s.play());
+		timer t;
+		while (s.playing && t.elapsed < 4000) {
+			m.set_impulse_response_params(1, 0.2 + t.elapsed / 10000.0, 1); // Eased every frame, as games do with distance.
+			wait(10);
+		}
+		assert(!s.playing);
+	}
+	assert(m.set_impulse_response("")); // Off.
+}
+
+// audio_decoder: raw samples out of files and datastreams, nothing played.
+uint64 sound_test_count_frames(audio_decoder@ d) {
+	uint64 frames = 0;
+	float[]@ chunk;
+	while ((@chunk = d.read(4096)).length() > 0) frames += chunk.length() / d.channels;
+	return frames;
+}
+void test_sound_audio_decoder() {
+	audio_decoder d;
+	assert(d.open("data/audio/yfs.wav"));
+	assert(d.sample_rate > 0 && d.channels > 0);
+	assert(d.read(1000).length() == 1000 * d.channels);
+	assert(d.cursor_frames == 1000);
+	uint64 total = 1000 + sound_test_count_frames(d);
+	assert(abs(total * 1000.0 / d.sample_rate - 1634) < 60, "decoded " + total + " frames");
+	assert(total == d.length_frames);
+	assert(!d.active);
+	assert(d.seek_frames(0));
+	assert(d.active);
+	// Asked for 16 kHz mono, the same clip comes out at that rate, at the same length.
+	audio_decoder r;
+	assert(r.open("data/audio/yfs.ogg", sound_default_pack, 16000, 1));
+	assert(r.sample_rate == 16000 && r.channels == 1);
+	uint64 resampled = sound_test_count_frames(r);
+	assert(abs(resampled / 16.0 - 1634) < 60, "resampled to " + resampled + " frames");
+	// A datastream that can't seek, like a network response, is decoded as it is read rather than first read whole.
+	datastream encoded;
+	hex_encoder h(encoded);
+	h.write(sound_test_read_file("data/audio/yfs.ogg"));
+	h.close();
+	encoded.seek(0);
+	audio_decoder s;
+	assert(s.open(hex_decoder(encoded)));
+	audio_decoder f;
+	assert(f.open("data/audio/yfs.ogg"));
+	float[]@ from_stream = s.read(2000), from_file = f.read(2000);
+	assert(from_stream.length() == from_file.length());
+	for (uint i = 0; i < from_file.length(); i++) assert(from_stream[i] == from_file[i], "sample " + i + " differs");
+	assert(abs((2000 + sound_test_count_frames(s)) * 1000.0 / s.sample_rate - 1634) < 60);
+	assert(!audio_decoder().open("data/audio/no_such_file.ogg"));
+	assert(s.close());
+	assert(!s.close());
+}
+
+// sound_play starts a sound and keeps it alive until it ends, whether or not the script holds on to it.
+void test_sound_play() {
+	sound@ s = sound_play("data/audio/yfs.wav");
+	assert(@s != null);
+	assert(s.playing == SOUND_AVAILABLE);
+	assert(@sound_play("data/audio/no_such_file.wav") == null);
+	sound@ q = sound_play("data/audio/yfs.wav", vector(5, 0, 0), -10, 20, 150, null, sound_default_pack, false);
+	assert(!q.playing);
+	assert(q.volume == -10 && q.pitch == 150);
+	assert(q.play());
+	for (int i = 0; i < 20; i++) sound_play("data/audio/yfs.ogg", volume: -100); // Handles dropped at once.
+	if (!SOUND_AVAILABLE) return;
+	wait(2000);
+	assert(!s.playing);
+	assert(@sound_play("data/audio/yfs.ogg", volume: -100) != null); // Lets go of the finished ones.
+	assert(sound_netstream_buffer_size > 0);
+	uint old_size = sound_netstream_buffer_size;
+	sound_netstream_buffer_size = 1024 * 1024;
+	assert(sound_netstream_buffer_size == 1024 * 1024);
+	sound_netstream_buffer_size = old_size;
+}
+
+// Speech from engines that hand back audio, and tone_synth, play through the sound engine.
+void test_sound_tts_and_tone_synth() {
+	tts_voice v("fallback");
+	sound@ spoken = v.speak_to_sound("testing");
+	assert(@spoken != null && spoken.length > 200, "speak_to_sound length " + (@spoken != null ? spoken.length : -1));
+	string wav = v.speak_to_memory("testing");
+	assert(wav.substr(0, 4) == "RIFF");
+	sound from_wav;
+	assert(from_wav.load(wav, wav.length()));
+	assert(abs(from_wav.length - spoken.length) < 30);
+	tone_synth t;
+	assert(t.note_ms("c4", 300));
+	sound@ tone = t.write_wave_sound();
+	assert(@tone != null && abs(tone.length - 300) < 30, "tone length " + (@tone != null ? tone.length : -1));
+	if (!SOUND_AVAILABLE) return;
+	assert(v.speak("testing one two three"));
+	assert(v.speaking);
+	assert(v.speak("and then more")); // Queued after the first.
+	timer timeout;
+	while (v.speaking && timeout.elapsed < 20000) wait(10);
+	assert(!v.speaking, "speech never finished");
+	assert(timeout.elapsed > 500); // Both were heard out.
+	assert(v.speak("this is cut off"));
+	wait(100);
+	assert(v.stop());
+	wait(100);
+	assert(!v.speaking, "stop didn't silence it");
+}

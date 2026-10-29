@@ -68,7 +68,7 @@
 #include "reactphysics.h"
 #include "scriptstuff.h"
 #include "serialize.h"
-#include "sound.h"
+#include "opus_codec.h"
 #include "nvsound.h"
 #include "system_fingerprint.h"
 #include "threading.h"
@@ -134,6 +134,7 @@ std::unordered_map<std::string, asITypeInfo*> g_TypeInfoCache;
 Timestamp g_script_build_time;
 unordered_map<string, string> g_system_namespaces;
 vector<string> g_pending_plugins;
+static bool g_legacy_sound_requested = false; // A script asked for the legacy_sound plugin, whose API is now the built in one.
 
 class NVGTBytecodeStream : public asIBinaryStream {
 	unsigned char* content;
@@ -523,15 +524,11 @@ int ConfigureEngine(asIScriptEngine *engine) {
 	engine->SetDefaultAccessMask(NVGT_SUBSYSTEM_SOUND);
 	engine->BeginConfigGroup("sound");
 	system_namespace("sound");
-	RegisterSoundsystem(engine);
-	system_namespace();
-	engine->EndConfigGroup();
-	// The new SDL3 + Steam Audio engine lives in the steam namespace while it is being built alongside the MiniAudio one, which it will replace.
-	engine->BeginConfigGroup("nvsound");
-	engine->SetDefaultNamespace("steam");
 	nvsound::RegisterNvsound(engine);
 	nvsound::RegisterNvsoundMicrophone(engine);
 	nvsound::RegisterNvsoundEnvironment(engine);
+	nvsound::RegisterNvsoundDecoder(engine);
+	RegisterOpusCodec(engine);
 	system_namespace();
 	engine->EndConfigGroup();
 	engine->BeginConfigGroup("tonesynth");
@@ -982,7 +979,11 @@ int PragmaCallback(const string &pragmaText, CScriptBuilder &builder, void* /*us
 	else if (cleanText.starts_with("document")) add_game_asset_to_bundle(cleanText.substr(9), GAME_ASSET_DOCUMENT);
 	else if (cleanText.starts_with("plugin ")) {
 		string plugin_name = cleanText.substr(7);
-		if (find(g_pending_plugins.begin(), g_pending_plugins.end(), plugin_name) == g_pending_plugins.end())
+		if (plugin_name == "legacy_sound") {
+			// The legacy sound API is built in now. Scripts written for the plugin also moved the built in sound system aside with "#pragma namespace sound ...", which would now move the very API they want, so that is undone too.
+			g_legacy_sound_requested = true;
+			g_system_namespaces.erase("sound");
+		} else if (find(g_pending_plugins.begin(), g_pending_plugins.end(), plugin_name) == g_pending_plugins.end())
 			g_pending_plugins.push_back(plugin_name);
 		builder.DefineWord(Poco::format("plugin_%s", plugin_name).c_str());
 	} else if (cleanText.starts_with("compiled_basename ")) {
@@ -1013,6 +1014,7 @@ int PragmaCallback(const string &pragmaText, CScriptBuilder &builder, void* /*us
 		string ns = cleanText.substr(10);
 		int space = ns.rfind(" ");
 		if (space == string::npos) return -1;
+		if (ns.substr(0, space) == "sound" && g_legacy_sound_requested) return 0; // See the plugin pragma.
 		g_system_namespaces[ns.substr(0, space)] = ns.substr(space + 1);
 	} else if (cleanText == "console") config.setString("build.windows_console", "");
 	else if (cleanText == "no_auto_chdir") config.setString("app.no_auto_chdir", "");

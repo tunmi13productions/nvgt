@@ -11,7 +11,7 @@ Starts writing a log file, in the manner of Python's logging module.
 bool: true if the log was opened, false if no writable location could be found.
 
 ## Remarks:
-Everything NVGT itself reports goes into the same file, so a log started this way also collects sound loading failures, miniaudio's own complaints, compilation errors and unhandled exceptions.
+Everything NVGT itself reports goes into the same file, so a log started this way also collects sound loading failures, compilation errors and unhandled exceptions.
 
 If the directory holding your program cannot be written to, which is normal for a game installed under Program Files or inside a macOS bundle, the log falls back to the user's preferences directory. Read `log_path` to find out where it actually landed.
 

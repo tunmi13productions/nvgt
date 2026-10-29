@@ -79,13 +79,12 @@ NVGT writes to these:
 * `nvgt` for general engine errors, which is where every internal error message ends up.
 * `nvgt.compiler` for compilation errors and warnings.
 * `nvgt.script` for unhandled exceptions and unexpected termination.
-* `nvgt.sound` for the sound system, including every failed load with the reason it failed.
-* `nvgt.sound.miniaudio` for miniaudio's own output, which explains a great deal about why a device or a file would not open.
+* `nvgt.sound` for the sound system: files that couldn't be opened or weren't audio, URL streams that failed, and an output device that wouldn't open.
 
-A level set on a channel applies to everything beneath it. This matters most for `nvgt.sound.miniaudio`, which describes every audio device on the machine in detail at `LOG_DEBUG`. Turn it down when you want the rest of the log at debug:
+A level set on a channel applies to everything beneath it, so a level on `nvgt` covers `nvgt.sound` too unless that has a level of its own:
 
 ```
-set_log_channel_level("nvgt.sound.miniaudio", LOG_WARN);
+set_log_channel_level("nvgt.sound", LOG_WARN);
 ```
 
 ## Configuration properties
@@ -95,7 +94,7 @@ These can go in a config file beside NVGT, in a `.properties`, `.ini` or `.json`
 * `logging.file` names the file, default `errors.log`.
 * `logging.level` sets the starting level, default `warning`.
 * `logging.directory` overrides where a relative filename is resolved against.
-* `logging.channels` takes a comma separated list of `name=level` pairs, for example `nvgt.sound=debug,nvgt.sound.miniaudio=warning`.
+* `logging.channels` takes a comma separated list of `name=level` pairs, for example `nvgt=warning,nvgt.sound=error`.
 * `logging.console` also writes each message to standard error.
 * `logging.source` adds the C++ file and line to the pattern, which is only useful when debugging NVGT itself.
 * `logging.pattern` replaces the message format outright. It takes Poco pattern specifiers.

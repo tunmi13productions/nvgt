@@ -1,5 +1,7 @@
 # Why the Dattorro plate, and not the other four
 
+> Since this was written, the MiniAudio engine and its `audio_plate_reverb_node` were replaced. The same Dattorro plate is now the `plate` effect, used through `set_fx("plate:...")`, and what follows still describes it.
+
 NVGT shipped one reverb: `audio_freeverb_node`, a wrapper around Philip Bennefall's verblib, which is itself a cleanup of Jezar's public domain Freeverb from 2000. It is fine. It is also 8 parallel comb filters into 4 allpasses, and that architecture has a ceiling you can hear.
 
 This document records why the replacement is a Dattorro plate rather than Zita-rev1, an Airwindows port, convolution, or Freeverb3, and what the new node actually costs.

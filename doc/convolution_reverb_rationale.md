@@ -1,5 +1,7 @@
 # Convolution reverb: what it is, and what it is not
 
+> Since this was written, the MiniAudio engine and its `audio_convolution_reverb_node` were replaced. The same algorithm now lives in `src/nvsound_convolver.cpp`, behind `mixer.set_impulse_response()`, and what follows still describes how it works.
+
 `plate_reverb_rationale.md` flagged convolution as the natural second reverb node, since it is the
 same partitioned FFT machinery the phonon HRTF path already uses, and does not compete with the
 plate on license grounds: an FFT is math, not a copyrightable expression, and the algorithm here

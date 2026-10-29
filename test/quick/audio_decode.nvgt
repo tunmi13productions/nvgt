@@ -5,10 +5,10 @@
 void main() {
 	audio_decoder d;
 	if(!d.open(file("../data/audio/points.ogg", "rb"))) {
-		alert("can't open", SOUNDSYSTEM_LAST_ERROR);
+		alert("can't open", "audio_decoder could not open points.ogg");
 		exit();
 	}
 	sound s;
-	s.stream_pcm(d.read(1024 * 256), d.sample_rate, d.channels);
-	wait(1000);
+	s.push_memory(d.read(1024 * 256), true, d.sample_rate, d.channels);
+	s.play_wait();
 }

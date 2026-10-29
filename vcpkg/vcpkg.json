@@ -4,7 +4,6 @@
     "fast-float",
     "libflac",
     "libffi",
-    "miniaudio",
     "miniupnpc",
     "libobfuscate",
     "zlib",

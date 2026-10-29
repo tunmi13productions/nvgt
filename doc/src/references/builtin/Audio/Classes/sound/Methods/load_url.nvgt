@@ -1,0 +1,20 @@
+/**
+	Streams audio from a URL, such as an internet radio station or a file on a web server.
+	bool sound::load_url(const string&in url);
+	## Arguments:
+		* const string&in url: the address of the audio (http, https or ftp).
+	## Returns:
+		bool: true if the stream connected and its format was recognized, false otherwise.
+	## Remarks:
+		The audio is read ahead of what is playing, on a thread of its own, so a slow moment on the network doesn't interrupt playback. How far ahead it reads is set by sound_netstream_buffer_size, and how much is waiting right now can be read from sound_netstream_buffered.
+		A live stream can't be seeked, and its length is unknown.
+		This blocks until the server has sent enough to recognize the format, or gives up if it sends nothing for 15 seconds.
+*/
+
+// Example:
+void main() {
+	sound s;
+	bool success = s.load_url("https://example.com/my_sound.mp3");
+	alert("Result", "The sound is " + (success == false? "not " : "") + "ready to play.");
+	if (success) s.play_wait();
+}

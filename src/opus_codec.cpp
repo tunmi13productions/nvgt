@@ -125,6 +125,14 @@ static nvgt_opus_encoder* create_opus_encoder(int sample_rate, int channels, int
 static nvgt_opus_decoder* create_opus_decoder(int sample_rate, int channels) { return new nvgt_opus_decoder(sample_rate, channels); }
 
 void RegisterOpusCodec(asIScriptEngine* engine) {
+	engine->RegisterEnum("opus_signal_type");
+	engine->RegisterEnumValue("opus_signal_type", "OPUS_AUTO", OPUS_AUTO);
+	engine->RegisterEnumValue("opus_signal_type", "OPUS_SIGNAL_VOICE", OPUS_SIGNAL_VOICE);
+	engine->RegisterEnumValue("opus_signal_type", "OPUS_SIGNAL_MUSIC", OPUS_SIGNAL_MUSIC);
+	engine->RegisterEnum("opus_application_type");
+	engine->RegisterEnumValue("opus_application_type", "OPUS_APPLICATION_VOIP", OPUS_APPLICATION_VOIP);
+	engine->RegisterEnumValue("opus_application_type", "OPUS_APPLICATION_AUDIO", OPUS_APPLICATION_AUDIO);
+	engine->RegisterEnumValue("opus_application_type", "OPUS_APPLICATION_RESTRICTED_LOWDELAY", OPUS_APPLICATION_RESTRICTED_LOWDELAY);
 	int ot = engine->RegisterObjectType("opus_encoder", 0, asOBJ_REF); assert(ot >= 0);
 	engine->RegisterObjectBehaviour("opus_encoder", asBEHAVE_FACTORY, "opus_encoder@ e(int sample_rate, int channels, int application)", asFUNCTION(create_opus_encoder), asCALL_CDECL);
 	engine->RegisterObjectBehaviour("opus_encoder", asBEHAVE_ADDREF, "void f()", asMETHOD(nvgt_opus_encoder, duplicate), asCALL_THISCALL);
