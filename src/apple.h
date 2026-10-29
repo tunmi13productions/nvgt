@@ -17,12 +17,17 @@ class asIScriptEngine;
 class CScriptArray;
 class game_window;
 
+#ifndef NVGT_USE_PRISM
 bool voice_over_is_running();
 bool voice_over_speak(const std::string& message, bool interrupt = true);
+#endif
 void voice_over_window_created(game_window* window);
+#ifndef NVGT_USE_PRISM
 void voice_over_speech_shutdown();
+#endif
 std::string apple_input_box(const std::string& title, const std::string& message, const std::string& default_value = "", bool secure = false, bool readonly = false);
 
+#ifndef NVGT_USE_PRISM
 // Definition for AVTTSVoice class created by Gruia Chiscop on 6/6/24.
 class AVTTSVoice : public tts_engine_impl {
 public:
@@ -68,3 +73,4 @@ private:
 	Impl* impl;
 	int RefCount;
 };
+#endif

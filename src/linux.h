@@ -16,6 +16,7 @@
 
 bool screen_reader_is_speaking();
 
+#ifndef NVGT_USE_PRISM
 class speechd_engine : public tts_engine_impl {
 	void* connection;
 	bool loaded;
@@ -27,3 +28,4 @@ public:
 	virtual bool is_speaking() override;
 	virtual bool stop() override;
 };
+#endif

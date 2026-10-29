@@ -65,7 +65,7 @@
     },
     {
       "name": "ethindp-prism",
-      "platform": "!linux"
+      "platform": "windows | osx"
     },
     {
       "name": "ethindp-prism",

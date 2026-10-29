@@ -1,6 +1,6 @@
 set(VCPKG_TARGET_ARCHITECTURE x64)
 set(VCPKG_CRT_LINKAGE dynamic)
-if(PORT MATCHES "libgit" OR PORT MATCHES "libplist" OR PORT MATCHES "libarchive")
+if(PORT MATCHES "libgit" OR PORT MATCHES "libplist" OR PORT MATCHES "libarchive" OR PORT MATCHES "ethindp-prism")
 	set(VCPKG_LIBRARY_LINKAGE dynamic)
 	set(VCPKG_FIXUP_ELF_RPATH ON)
 else()

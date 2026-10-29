@@ -1,7 +1,7 @@
 set(VCPKG_TARGET_ARCHITECTURE arm64)
 set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_CMAKE_SYSTEM_NAME Darwin)
-if(PORT MATCHES "libgit" OR PORT MATCHES "libplist" OR PORT MATCHES "libarchive")
+if(PORT MATCHES "libgit" OR PORT MATCHES "libplist" OR PORT MATCHES "libarchive" OR PORT MATCHES "ethindp-prism")
 	set(VCPKG_LIBRARY_LINKAGE dynamic)
 else()
 	set(VCPKG_LIBRARY_LINKAGE static)

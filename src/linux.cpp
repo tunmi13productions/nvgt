@@ -19,6 +19,7 @@
 #include <stdexcept>
 using namespace std;
 
+#ifndef NVGT_USE_PRISM // With Prism, prism_speech.cpp provides the screen_reader_* functions and tts_voice engines, Speech Dispatcher and Orca among them.
 #define spd_get_default_address (*spd_get_default_address)
 #define spd_open2 (*spd_open2)
 #define spd_close (*spd_close)
@@ -140,6 +141,7 @@ bool screen_reader_silence() {
 	if (!screen_reader_load()) return false;
 	return g_screen_reader_voice->stop();
 }
+#endif // NVGT_USE_PRISM
 
 unsigned long long system_running_milliseconds() {
 	struct timespec ts;

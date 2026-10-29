@@ -33,6 +33,7 @@
 #include "UI.h"
 #include "xplatform.h"
 
+#ifndef NVGT_USE_PRISM // With Prism, prism_speech.cpp provides the screen_reader_* functions and tts_voice engines, VoiceOver and AVSpeech among them.
 void register_native_tts() { tts_engine_register("avspeech", []() -> std::shared_ptr<tts_engine> { return std::make_shared<AVTTSVoice>(); }); }
 
 // AVTTSVoice::impl class created by Gruia Chiscop on 6/6/24.
@@ -359,6 +360,7 @@ void vo_speech_thread(void* extra) {
 	speech_text = "";
 }
 
+#endif // NVGT_USE_PRISM
 void voice_over_window_created(game_window* window) {
 	#if TARGET_OS_IOS
 		UIWindow* win = (UIWindow*)window->get_native_window();
@@ -373,6 +375,7 @@ void voice_over_window_created(game_window* window) {
 	#endif
 }
 
+#ifndef NVGT_USE_PRISM
 bool voice_over_is_running() {
 	#if TARGET_OS_IOS
 		return UIAccessibilityIsVoiceOverRunning();
@@ -414,6 +417,7 @@ bool screen_reader_output(const std::string& text, bool interrupt) { return voic
 bool screen_reader_speak(const std::string& text, bool interrupt) { return voice_over_speak(text, interrupt); }
 bool screen_reader_braille(const std::string& text) { return false; }
 bool screen_reader_silence() { return voice_over_speak("", true); }
+#endif // NVGT_USE_PRISM
 // The following code was originally taken from https://github.com/hammerspoon/hammerspoon under an MIT license, but has been heavily trimmed/modified for our simpler needs and basically consists of system API calls. It was then run through Claude to create the IOS version.
 #if !TARGET_OS_IOS
 std::string apple_input_box(const std::string& title, const std::string& message, const std::string& default_value, bool secure, bool readonly) {

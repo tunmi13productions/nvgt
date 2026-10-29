@@ -15,6 +15,7 @@
 #include <prism.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <memory>

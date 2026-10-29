@@ -109,8 +109,10 @@ if  ARGUMENTS.get("no_plugins", "0") == "0":
 
 # Project libraries
 env.Append(LIBS = ["deps"] + common_libs + ["zs" if env["NVGT_TARGET"] == "windows" else "z", "SDL3", "phonon", "ASAddon"])
-# Speech through Prism; other platforms keep their own speech code until they are built with it. prism.dll is delay loaded from lib like the other DLLs there, and prism_speech.cpp checks it can be loaded before calling it.
-if env["NVGT_TARGET"] == "windows": env.Append(LIBS = ["prism"], CPPDEFINES = ["NVGT_USE_PRISM"], LINKFLAGS = ["/delayload:prism.dll"])
+# Speech through Prism on the desktop platforms. Android and iOS keep their own speech code until Prism is built for them: Android needs its Java side packaged, and iOS links everything statically, where Prism collides with NVGT symbols.
+# Prism is a shared library on each of them. On Windows prism.dll is delay loaded from lib like the other DLLs there, and prism_speech.cpp checks it can be loaded before calling it.
+if env["NVGT_TARGET"] in ("windows", "macos", "linux"): env.Append(LIBS = ["prism"], CPPDEFINES = ["NVGT_USE_PRISM"])
+if env["NVGT_TARGET"] == "windows": env.Append(LINKFLAGS = ["/delayload:prism.dll"])
 
 # nvgt itself
 sources = [str(i)[4:] for i in Glob("src/*.cpp")]
