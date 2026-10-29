@@ -64,20 +64,16 @@
       ]
     },
     {
-      "name": "universalspeech",
-      "platform": "windows"
+      "name": "ethindp-prism",
+      "platform": "!linux"
     },
     {
-      "name": "bass",
-      "platform": "!ios"
-    },
-    {
-      "name": "bass-fx",
-      "platform": "!ios"
-    },
-    {
-      "name": "bassmix",
-      "platform": "!ios"
+      "name": "ethindp-prism",
+      "platform": "linux",
+      "features": [
+        "orca",
+        "speech-dispatcher"
+      ]
     },
     {
       "name": "libmysofa",

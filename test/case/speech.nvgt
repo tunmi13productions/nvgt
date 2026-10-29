@@ -1,0 +1,51 @@
+// Speech through Prism: tts_voice engines for the system's synthesizers, and the screen_reader_* functions.
+
+void test_speech_engines_include_the_system_synthesizers() {
+	string[]@ engines = tts_voice().list_voices();
+	assert(engines.length() > 0, "no voices at all");
+	tts_voice v;
+	assert(v.voice_count > 0);
+	if (!system_is_windows) return;
+	// Windows always has SAPI. Through Prism it keeps the engine name it had before, so asking for it by name still works.
+	tts_voice sapi("sapi5");
+	assert(sapi.voice_count > 0, "no SAPI voices");
+	assert(sapi.voice_count <= v.voice_count);
+}
+
+void test_speech_synthesizer_renders_audio() {
+	if (!system_is_windows) return;
+	tts_voice v("sapi5");
+	if (v.voice_count == 0) return;
+	sound@ s = v.speak_to_sound("Prism is speaking through the sound engine.");
+	assert(@s != null, "speak_to_sound gave nothing");
+	assert(s.length > 500, "spoken length " + s.length);
+	string wav = v.speak_to_memory("testing");
+	assert(wav.substr(0, 4) == "RIFF");
+	sound from_wav;
+	assert(from_wav.load(wav, wav.length()));
+	assert(from_wav.length > 100);
+	// Rate is the tts_voice scale, -10 to 10, carried to Prism's 0 to 1.
+	v.rate = 5;
+	assert(abs(v.rate - 5) < 0.5, "rate read back as " + v.rate);
+	sound@ fast = v.speak_to_sound("Prism is speaking through the sound engine.");
+	assert(@fast != null && fast.length < s.length, "a faster rate wasn't shorter: " + fast.length + " vs " + s.length);
+	v.rate = 0;
+	if (!SOUND_AVAILABLE) return;
+	assert(v.speak("one two three"));
+	assert(v.speaking);
+	timer t;
+	while (v.speaking && t.elapsed < 15000) wait(10);
+	assert(!v.speaking);
+}
+
+void test_speech_screen_reader_functions_answer() {
+	// Whether a screen reader is running depends on the machine, so only check the answers agree with each other.
+	string reader = screen_reader_detect();
+	bool has = screen_reader_has_speech();
+	assert((reader != "") == has, "detect says '" + reader + "' but has_speech says " + has);
+	if (!has) {
+		assert(!screen_reader_speak("nobody hears this"));
+		assert(!screen_reader_output("nobody hears this"));
+		assert(!screen_reader_is_speaking());
+	}
+}

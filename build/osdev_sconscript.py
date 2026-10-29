@@ -47,8 +47,8 @@ set_osdev_paths(env)
 
 # Copy dynamic libraries to the release/lib directory. Usually these are contained in osdev/bin or osdev/lib, but the entire libpath is searched. Later we may consider doing this only on a successful NVGT build, but this could cause it to happen too infrequently.
 def copy_osdev_libraries(env):
-	libs = ["archive", "bass", "bass_fx", "bassmix", "git2", "plist-2.0", "phonon"]
-	if env["NVGT_TARGET"] == "windows": libs += ["GPUUtilities", "nvdaControllerClient64", "SAAPI64", "TrueAudioNext", "zdsrapi"]
+	libs = ["archive", "git2", "plist-2.0", "phonon"]
+	if env["NVGT_TARGET"] == "windows": libs += ["GPUUtilities", "prism", "SAAPI64", "TrueAudioNext", "zdsrapi"] # Prism reaches NVDA itself; System Access and ZDSR still need their own client DLLs.
 	for l in libs:
 		env.Install("#release/lib", FindFile(env.subst("${SHLIBPREFIX}" + l + ("$SHLIBSUFFIX" if not env["SHLIBSUFFIX"] in l else "")), env["LIBPATH"]))
 

@@ -33,8 +33,10 @@ using namespace std;
 
 // Trim prenormalized TTS based on minimum thresholds in dB. Size is in frames.
 template <class t> static t *tts_trim_internal(t *data, unsigned int* size_in_frames, int channels, float begin_db, float end_db) {
-	t min_begin_sample = ceil(pow(10.0, begin_db / 20.0) * (double)numeric_limits<t>::max());
-	t min_end_sample = ceil(pow(10.0, end_db / 20.0) * (double)numeric_limits<t>::max());
+	// Full scale is 1 for float samples, and the type's largest value for integer ones.
+	double full_scale = numeric_limits<t>::is_integer ? (double)numeric_limits<t>::max() : 1.0;
+	double min_begin_sample = pow(10.0, begin_db / 20.0) * full_scale;
+	double min_end_sample = pow(10.0, end_db / 20.0) * full_scale;
 	for (unsigned long i = 0; i < *size_in_frames; i++) {
 		double mean = 0;
 		for (int c = 0; c < channels; c++)
@@ -74,15 +76,23 @@ static void* tts_trim(tts_audio_data* data, float begin_db = -60, float end_db =
 			trimmed_data = tts_trim_internal<char>((char*)data->data, &size_in_frames, data->channels, begin_db, end_db);
 			data->size_in_bytes = size_in_frames * data->channels;
 			return trimmed_data;
+		case 32: // Float, as Prism gives it.
+			size_in_frames = data->size_in_bytes / 4 / data->channels;
+			trimmed_data = tts_trim_internal<float>((float*)data->data, &size_in_frames, data->channels, begin_db, end_db);
+			data->size_in_bytes = size_in_frames * 4 * data->channels;
+			return trimmed_data;
 		default:
 			return data->data;
 	}
 }
 
-// Engines hand back 16 bit signed or 8 bit unsigned samples.
+// Engines hand back 32 bit float, 16 bit signed or 8 bit unsigned samples.
 static vector<float> tts_to_float(const void* data, unsigned int size_in_bytes, unsigned int bitsize) {
 	vector<float> out;
-	if (bitsize == 16) {
+	if (bitsize == 32) {
+		const float* s = (const float*)data;
+		out.assign(s, s + size_in_bytes / 4);
+	} else if (bitsize == 16) {
 		const int16_t* s = (const int16_t*)data;
 		out.resize(size_in_bytes / 2);
 		for (size_t i = 0; i < out.size(); i++) out[i] = s[i] / 32768.0f;
@@ -93,8 +103,17 @@ static vector<float> tts_to_float(const void* data, unsigned int size_in_bytes, 
 	}
 	return out;
 }
-// A whole wav file around the samples, as speak_to_file and speak_to_memory give back.
+// A whole wav file around the samples, as speak_to_file and speak_to_memory give back. Float samples are written as 16 bit, as speech files always were.
 static string tts_to_wav(const void* data, unsigned int size_in_bytes, unsigned int sample_rate, unsigned int channels, unsigned int bitsize) {
+	vector<int16_t> converted;
+	if (bitsize == 32) {
+		const float* f = (const float*)data;
+		converted.resize(size_in_bytes / 4);
+		for (size_t i = 0; i < converted.size(); i++) converted[i] = int16_t(lrintf(max(-1.0f, min(1.0f, f[i])) * 32767.0f));
+		data = converted.data();
+		size_in_bytes = unsigned(converted.size() * 2);
+		bitsize = 16;
+	}
 	string out(44 + size_in_bytes, '\0');
 	char* p = &out[0];
 	auto put32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; i++) p[at + i] = char((v >> (i * 8)) & 0xff); };
