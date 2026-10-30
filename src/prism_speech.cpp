@@ -94,8 +94,8 @@ static PrismBackend* screen_reader() {
 	for (PrismBackendId id : ids) {
 		PrismBackend* b = prism_registry_create(p->ctx, id);
 		if (!b) continue;
-		uint64_t features = prism_backend_get_features(b);
-		if ((features & PRISM_BACKEND_IS_SUPPORTED_AT_RUNTIME) && prism_backend_initialize(b) == PRISM_OK) {
+		// Some backends, Speech Dispatcher among them, only report whether they're usable once initialized.
+		if (prism_backend_initialize(b) == PRISM_OK && (prism_backend_get_features(b) & PRISM_BACKEND_IS_SUPPORTED_AT_RUNTIME)) {
 			g_sr = b;
 			g_sr_features = prism_backend_get_features(b);
 			break;

@@ -19,6 +19,10 @@ if(VCPKG_TARGET_IS_WINDOWS)
     endif()
     vcpkg_list(APPEND options "CFLAGS=\${CFLAGS} ${linkage_flag}")
 endif()
+# libffi's configure replaces CFLAGS, so the triplet's -fPIC never reaches it. Ask libtool for PIC objects instead: on Linux the static library goes into libprism.so through glib.
+if(VCPKG_TARGET_IS_LINUX)
+    vcpkg_list(APPEND options --with-pic)
+endif()
 
 vcpkg_cmake_get_vars(cmake_vars_file ADDITIONAL_LANGUAGES ASM)
 include("${cmake_vars_file}")

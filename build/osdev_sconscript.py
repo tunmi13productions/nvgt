@@ -49,6 +49,7 @@ set_osdev_paths(env)
 def copy_osdev_libraries(env):
 	libs = ["archive", "git2", "plist-2.0", "phonon"]
 	if env["NVGT_TARGET"] in ("macos", "linux"): libs.append("prism")
+	if env["NVGT_TARGET"] == "linux": libs += ["glib-2.0.so.0", "gobject-2.0.so.0", "gio-2.0.so.0", "gmodule-2.0.so.0"] # libprism.so's glib, by soname since NVGT doesn't link them itself.
 	if env["NVGT_TARGET"] == "windows": libs += ["GPUUtilities", "prism", "SAAPI64", "TrueAudioNext", "zdsrapi"] # Prism reaches NVDA itself; System Access and ZDSR still need their own client DLLs.
 	for l in libs:
 		env.Install("#release/lib", FindFile(env.subst("${SHLIBPREFIX}" + l + ("$SHLIBSUFFIX" if not env["SHLIBSUFFIX"] in l else "")), env["LIBPATH"]))

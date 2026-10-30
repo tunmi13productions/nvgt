@@ -124,7 +124,10 @@ static bool open_output(unsigned int index) {
 bool init() {
 	if (g_initialized) return true;
 	if (g_shut_down) return false;
-	if (!(SDL_WasInit(0) & SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) return false;
+	if (!(SDL_WasInit(0) & SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		NVGT_ERROR("nvgt.sound", Poco::format("could not start audio: %s", std::string(SDL_GetError())));
+		return false;
+	}
 	// The engine runs at the default device's own rate so nothing is resampled on the way out. Switching to a device with a different rate later lets SDL convert.
 	SDL_AudioSpec spec;
 	int frames;

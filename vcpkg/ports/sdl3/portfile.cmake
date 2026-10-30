@@ -34,6 +34,13 @@ list(APPEND FEATURE_OPTIONS -DSDL_UNIX_CONSOLE_BUILD=ON)
 if (VCPKG_TARGET_IS_LINUX AND NOT "x11" IN_LIST FEATURES AND NOT "wayland" IN_LIST FEATURES)
     message(WARNING "The selected features don't allow sdl3 to create windows, which is usually unintentional. You can get windowing support by installing the x11 and/or wayland features.")
 endif()
+# NVGT's sound goes out through SDL, so on Linux SDL must have PulseAudio and PipeWire. Both are loaded at run time and only need their headers here, but SDL quietly leaves out any it can't find, so check for them.
+if (VCPKG_TARGET_IS_LINUX)
+    if (NOT EXISTS "/usr/include/pulse/pulseaudio.h" OR NOT EXISTS "/usr/include/pipewire-0.3/pipewire/pipewire.h")
+        message(FATAL_ERROR "SDL needs the PulseAudio and PipeWire headers for audio output:\nsudo apt install libpulse-dev libpipewire-0.3-dev\n")
+    endif()
+    list(APPEND FEATURE_OPTIONS -DSDL_PULSEAUDIO=ON -DSDL_PULSEAUDIO_SHARED=ON -DSDL_PIPEWIRE=ON -DSDL_PIPEWIRE_SHARED=ON)
+endif()
 
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
