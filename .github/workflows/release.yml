@@ -104,6 +104,15 @@ jobs:
         PASS="${{ secrets.NVGT_CONFIG_TRANSFER_KEY }}"
         [ -z "$PASS" ] && PASS="nvgt_fork_build_passphrase"
         openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:"$PASS" -in nvgt_config.h.enc -out user/nvgt_config.h
+    # Prism needs C++23's <expected>, which 22.04's default GCC 11 lacks. GCC 12 has it and is in 22.04's own
+    # repositories, so the build stays on 22.04 and keeps running on older distributions. Both the dependency
+    # build and NVGT's own (SConstruct reads CC and CXX) use it.
+    - name: use gcc 12
+      run: |
+        sudo apt update
+        sudo apt install -y gcc-12 g++-12
+        echo "CC=gcc-12" >> $GITHUB_ENV
+        echo "CXX=g++-12" >> $GITHUB_ENV
     - uses: actions/cache@v4
       with:
         path: lindev
