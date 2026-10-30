@@ -49,3 +49,22 @@ void test_speech_screen_reader_functions_answer() {
 		assert(!screen_reader_is_speaking());
 	}
 }
+
+void test_speech_screen_reader_preference() {
+	string[]@ readers = screen_reader_list();
+	string reader = screen_reader_detect();
+	// The one in use is always among those running.
+	assert((reader == "") == readers.is_empty(), "detect says '" + reader + "' but the list holds " + readers.length());
+	if (reader != "") assert(readers.find(reader) > -1, reader + " isn't in the list: " + join(readers, ", "));
+	assert(screen_reader_preferred == "");
+	// Preferring one that isn't running falls back to automatic, rather than to nothing.
+	screen_reader_preferred = "no such screen reader";
+	assert(screen_reader_preferred == "no such screen reader");
+	assert(screen_reader_detect() == reader);
+	if (readers.length() > 1) {
+		screen_reader_preferred = readers[readers.length() - 1];
+		assert(screen_reader_detect() == readers[readers.length() - 1]);
+	}
+	screen_reader_preferred = "";
+	assert(screen_reader_detect() == reader);
+}

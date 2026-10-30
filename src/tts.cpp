@@ -472,6 +472,19 @@ CScriptArray *tts_get_engines() {
 	return array;
 }
 
+#ifndef NVGT_USE_PRISM
+// Without Prism a platform knows only the one screen reader it detects, and always uses that one.
+vector<string> screen_reader_list() {
+	string reader = screen_reader_detect();
+	if (reader.empty()) return {};
+	return {reader};
+}
+static string g_screen_reader_preferred;
+string get_screen_reader_preferred() { return g_screen_reader_preferred; }
+void set_screen_reader_preferred(const string& name) { g_screen_reader_preferred = name; }
+#endif
+static CScriptArray* script_screen_reader_list() { return vector_to_scriptarray<string>(screen_reader_list(), "string"); }
+
 tts_voice* new_tts_voice(const string& engines) { return new tts_voice(engines); }
 void RegisterTTSVoice(asIScriptEngine *engine) {
 	engine->RegisterObjectType("tts_voice", 0, asOBJ_REF);
@@ -515,4 +528,7 @@ void RegisterTTSVoice(asIScriptEngine *engine) {
 	engine->RegisterGlobalFunction("bool screen_reader_speak(const string &in text, bool interrupt = true)", asFUNCTION(screen_reader_speak), asCALL_CDECL);
 	engine->RegisterGlobalFunction("bool screen_reader_braille(const string &in text)", asFUNCTION(screen_reader_braille), asCALL_CDECL);
 	engine->RegisterGlobalFunction("bool screen_reader_silence()", asFUNCTION(screen_reader_silence), asCALL_CDECL);
+	engine->RegisterGlobalFunction("array<string>@ screen_reader_list()", asFUNCTION(script_screen_reader_list), asCALL_CDECL);
+	engine->RegisterGlobalFunction("string get_screen_reader_preferred() property", asFUNCTION(get_screen_reader_preferred), asCALL_CDECL);
+	engine->RegisterGlobalFunction("void set_screen_reader_preferred(const string&in name) property", asFUNCTION(set_screen_reader_preferred), asCALL_CDECL);
 }

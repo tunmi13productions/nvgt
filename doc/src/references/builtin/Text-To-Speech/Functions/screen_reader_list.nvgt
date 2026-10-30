@@ -1,0 +1,19 @@
+/**
+	Returns the names of the screen readers that are running.
+	string[]@ screen_reader_list();
+	## Returns:
+		string[]@: the name of every screen reader running now, in the order NVGT would choose between them automatically, or an empty array if there are none.
+	## Remarks:
+		Use this to let the user pick which screen reader to speak through when more than one is running, and pass the chosen name to the screen_reader_preferred property.
+		Finding out whether each screen reader is running means connecting to it, so call this when the list is wanted, such as when a settings menu opens, rather than every frame.
+		On platforms where speech doesn't go through Prism (Android and iOS) the list holds at most the one screen reader screen_reader_detect() finds.
+*/
+
+// Example:
+void main() {
+	string[]@ readers = screen_reader_list();
+	if (readers.is_empty())
+		alert("Info", "No screen reader is running.");
+	else
+		alert("Info", "Running: " + join(readers, ", ") + ". Speaking through " + screen_reader_detect() + ".");
+}

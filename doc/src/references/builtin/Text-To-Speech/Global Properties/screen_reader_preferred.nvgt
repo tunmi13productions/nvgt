@@ -1,0 +1,21 @@
+/**
+	The screen reader to speak through whenever it's running.
+	string screen_reader_preferred;
+	## Remarks:
+		Set this to one of the names screen_reader_list() returns. While that screen reader is running, the screen_reader_* functions use it; while it isn't, NVGT chooses automatically as it otherwise would, taking the highest priority screen reader that's running, and goes back to the preferred one once it starts again.
+		An empty string, the default, means automatic. Names are compared without regard to case.
+		On platforms where speech doesn't go through Prism (Android and iOS) there is only ever one screen reader to use, and this has no effect.
+*/
+
+// Example:
+void main() {
+	string[]@ readers = screen_reader_list();
+	if (readers.length() < 2) {
+		alert("Info", "Fewer than two screen readers are running, so there is nothing to choose between.");
+		return;
+	}
+	screen_reader_preferred = readers[readers.length() - 1];
+	screen_reader_speak("Now speaking through " + screen_reader_detect());
+	wait(2000);
+	screen_reader_preferred = ""; // Back to automatic.
+}

@@ -75,8 +75,39 @@ static bool is_screen_reader(PrismBackendId id) {
 // Screen readers.
 static std::mutex g_sr_mutex; // A Prism backend must only be used by one thread at a time.
 static PrismBackend* g_sr = nullptr;
+static PrismBackendId g_sr_id;
 static uint64_t g_sr_features = 0;
-// Must be called with g_sr_mutex held. Finds the highest priority screen reader that is running.
+static std::string g_sr_preferred; // screen_reader_preferred; empty for automatic.
+static bool names_match(const char* a, const std::string& b) {
+	if (!a || strlen(a) != b.size()) return false;
+	for (size_t i = 0; i < b.size(); i++) {
+		if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+	}
+	return true;
+}
+// Every screen reader Prism knows, highest priority first, with the preferred one, if any, ahead of them all.
+static std::vector<PrismBackendId> screen_reader_ids(PrismContext* ctx, const std::string& preferred) {
+	std::vector<PrismBackendId> ids;
+	for (size_t i = 0, n = prism_registry_count(ctx); i < n; i++) {
+		PrismBackendId id = prism_registry_id_at(ctx, i);
+		if (is_screen_reader(id)) ids.push_back(id);
+	}
+	std::stable_sort(ids.begin(), ids.end(), [&](PrismBackendId a, PrismBackendId b) {
+		bool a_preferred = names_match(prism_registry_name(ctx, a), preferred), b_preferred = names_match(prism_registry_name(ctx, b), preferred);
+		if (a_preferred != b_preferred) return a_preferred;
+		return prism_registry_priority(ctx, a) > prism_registry_priority(ctx, b);
+	});
+	return ids;
+}
+// Creates and initializes a backend, returning it only if it's running. Some backends, Speech Dispatcher among them, only report whether they're usable once initialized.
+static PrismBackend* open_screen_reader(PrismContext* ctx, PrismBackendId id) {
+	PrismBackend* b = prism_registry_create(ctx, id);
+	if (!b) return nullptr;
+	if (prism_backend_initialize(b) == PRISM_OK && (prism_backend_get_features(b) & PRISM_BACKEND_IS_SUPPORTED_AT_RUNTIME)) return b;
+	prism_backend_free(b);
+	return nullptr;
+}
+// Must be called with g_sr_mutex held. Finds the preferred screen reader if it's running, or else the highest priority one that is.
 static PrismBackend* screen_reader() {
 	if (!g_screen_reader_stale) return g_sr;
 	g_screen_reader_stale = false;
@@ -85,24 +116,42 @@ static PrismBackend* screen_reader() {
 	g_sr_features = 0;
 	std::shared_ptr<prism_context> p = get_prism();
 	if (!p) return nullptr;
-	std::vector<PrismBackendId> ids;
-	for (size_t i = 0, n = prism_registry_count(p->ctx); i < n; i++) {
-		PrismBackendId id = prism_registry_id_at(p->ctx, i);
-		if (is_screen_reader(id)) ids.push_back(id);
-	}
-	std::stable_sort(ids.begin(), ids.end(), [&](PrismBackendId a, PrismBackendId b) { return prism_registry_priority(p->ctx, a) > prism_registry_priority(p->ctx, b); });
-	for (PrismBackendId id : ids) {
-		PrismBackend* b = prism_registry_create(p->ctx, id);
-		if (!b) continue;
-		// Some backends, Speech Dispatcher among them, only report whether they're usable once initialized.
-		if (prism_backend_initialize(b) == PRISM_OK && (prism_backend_get_features(b) & PRISM_BACKEND_IS_SUPPORTED_AT_RUNTIME)) {
-			g_sr = b;
-			g_sr_features = prism_backend_get_features(b);
-			break;
-		}
-		prism_backend_free(b);
+	for (PrismBackendId id : screen_reader_ids(p->ctx, g_sr_preferred)) {
+		g_sr = open_screen_reader(p->ctx, id);
+		if (!g_sr) continue;
+		g_sr_id = id;
+		g_sr_features = prism_backend_get_features(g_sr);
+		break;
 	}
 	return g_sr;
+}
+std::vector<std::string> screen_reader_list() {
+	std::lock_guard<std::mutex> l(g_sr_mutex);
+	std::shared_ptr<prism_context> p = get_prism();
+	if (!p) return {};
+	screen_reader(); // So the one in use is known, and needn't be opened a second time below.
+	std::vector<std::string> names;
+	for (PrismBackendId id : screen_reader_ids(p->ctx, "")) {
+		bool running = g_sr && id == g_sr_id;
+		if (!running) {
+			PrismBackend* b = open_screen_reader(p->ctx, id);
+			running = b != nullptr;
+			if (b) prism_backend_free(b);
+		}
+		const char* name = prism_registry_name(p->ctx, id);
+		if (running && name) names.push_back(name);
+	}
+	return names;
+}
+std::string get_screen_reader_preferred() {
+	std::lock_guard<std::mutex> l(g_sr_mutex);
+	return g_sr_preferred;
+}
+void set_screen_reader_preferred(const std::string& name) {
+	std::lock_guard<std::mutex> l(g_sr_mutex);
+	if (name == g_sr_preferred) return;
+	g_sr_preferred = name;
+	g_screen_reader_stale = true; // Chosen again on the next screen reader call.
 }
 // Runs one call on the screen reader, choosing again next time if it has gone away.
 template <class F> static bool with_screen_reader(F call) {

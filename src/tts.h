@@ -172,5 +172,9 @@ bool screen_reader_output(const std::string& text, bool interrupt);
 bool screen_reader_speak(const std::string& text, bool interrupt);
 bool screen_reader_braille(const std::string& text);
 bool screen_reader_silence();
+std::vector<std::string> screen_reader_list(); // The screen readers running now, in the order automatic choice tries them.
+// The screen reader to use whenever it's running, by the name screen_reader_list gives it. Empty means automatic, the default.
+std::string get_screen_reader_preferred();
+void set_screen_reader_preferred(const std::string& name);
 
 void RegisterTTSVoice(asIScriptEngine *engine);
