@@ -191,7 +191,10 @@ std::vector<std::string> get_input_device_names() {
 }
 
 // sound_base
-sound_base::~sound_base() { release_phonon_state(phonon); }
+sound_base::~sound_base() {
+	clear_sends();
+	release_phonon_state(phonon);
+}
 void sound_base::add_ref() { ref_count++; }
 void sound_base::release() {
 	if (--ref_count == 0) delete this;
@@ -347,14 +350,18 @@ void sound_base::spatialize(float* frames, int count, const spatial_params& p, b
 	vol_db = std::clamp(v, 0.0f, 1.0f) * 100.0f - 100.0f;
 	pan_value = std::clamp(dx / (125.0f / p.pan_step), -1.0f, 1.0f) * 100.0f;
 }
-// Mixes stereo input into the output with the given volume and pans, ramping from the previous block's gains so that changes don't click.
-// The script's pan and the positioning pan were applied by separate stages under BASS, so their attenuations multiply rather than cancel.
-void sound_base::apply_gain(const float* in, float* out, int frames, float vol_db, float pan_value, float position_pan) {
-	float g = db_to_gain(vol_db), gl = g, gr = g;
+// The left and right gains for a volume and pans. The script's pan and the positioning pan were applied by separate stages under BASS, so their attenuations multiply rather than cancel.
+static void stereo_gains(float vol_db, float pan_value, float position_pan, float& gl, float& gr) {
+	gl = gr = db_to_gain(vol_db);
 	for (float p : {pan_value, position_pan}) {
 		if (p < 0) gr *= db_to_gain(p);
 		else if (p > 0) gl *= db_to_gain(-p);
 	}
+}
+// Mixes stereo input into the output with the given volume and pans, ramping from the previous block's gains so that changes don't click.
+void sound_base::apply_gain(const float* in, float* out, int frames, float vol_db, float pan_value, float position_pan) {
+	float gl, gr;
+	stereo_gains(vol_db, pan_value, position_pan, gl, gr);
 	if (last_gain_left < 0) {
 		last_gain_left = gl;
 		last_gain_right = gr;
@@ -368,6 +375,84 @@ void sound_base::apply_gain(const float* in, float* out, int frames, float vol_d
 	}
 	last_gain_left = gl;
 	last_gain_right = gr;
+}
+
+// Sends
+// Whether audio leaving from reaches m's input, up the mixer tree or through sends. Must be called with the graph mutex held.
+bool reaches(sound_base* from, mixer* m, int depth) {
+	if (depth > 64) return true; // Deeper than any real graph; refusing is the safe answer.
+	for (sound_base* n = from; n; n = n->parent) {
+		if (n == m) return true;
+		for (auto& s : n->sends) {
+			if (reaches(s->target, m, depth + 1)) return true;
+		}
+	}
+	return false;
+}
+// Adds a send to target, or changes the volume of the one already there.
+bool sound_base::set_send(mixer* target, float volume, bool after_distance) {
+	if (!target || target == this) return false;
+	volume = std::clamp(volume, -100.0f, 0.0f);
+	std::lock_guard<std::mutex> sl(sends_mutex);
+	for (auto& s : sends) {
+		if (s->target != target) continue;
+		s->volume = volume;
+		if (s->after_distance != after_distance) {
+			std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+			s->after_distance = after_distance;
+		}
+		return true;
+	}
+	std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+	// Refuse anything that would feed back into this node, which with a send's delay would ring or run away rather than recurse.
+	if (reaches(target, dynamic_cast<mixer*>(this), 0)) return false;
+	for (auto& b : target->send_in) {
+		if (b.buf.empty()) b.buf.assign(size_t(max_render_frames) * 2, 0.0f); // Allocated here because the audio thread shouldn't.
+	}
+	auto s = std::make_unique<send_slot>();
+	s->target = target;
+	s->volume = volume;
+	s->after_distance = after_distance;
+	target->add_ref();
+	sends.push_back(std::move(s));
+	return true;
+}
+// Removes the send to target, or every send when target is null.
+bool sound_base::remove_send(mixer* target) {
+	std::vector<std::unique_ptr<send_slot>> removed;
+	{
+		std::lock_guard<std::mutex> sl(sends_mutex);
+		std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+		auto keep = std::stable_partition(sends.begin(), sends.end(), [target](const std::unique_ptr<send_slot>& s) { return target && s->target != target; });
+		removed.assign(std::make_move_iterator(keep), std::make_move_iterator(sends.end()));
+		sends.erase(keep, sends.end());
+	}
+	for (auto& s : removed) s->target->release(); // Outside the locks, since releasing the last reference destroys the mixer.
+	return !removed.empty();
+}
+float sound_base::get_send(mixer* target) {
+	std::lock_guard<std::mutex> sl(sends_mutex);
+	for (auto& s : sends) {
+		if (s->target == target) return s->volume;
+	}
+	return -100;
+}
+void sound_base::clear_sends() { remove_send(nullptr); }
+// Called by render after spatializing, with the same volume and pans the node's own output gets.
+void sound_base::render_sends(const float* in, int frames, float vol_db, float position_vol_db, float pan_value, float position_pan) {
+	if (sends.empty()) return;
+	uint64_t block = g_frame_clock / block_frames;
+	for (auto& s : sends) {
+		float gl, gr;
+		stereo_gains(vol_db + (s->after_distance ? position_vol_db : 0) + s->volume.load(), pan_value, position_pan, gl, gr);
+		if (s->last_left < 0) {
+			s->last_left = gl;
+			s->last_right = gr;
+		}
+		s->target->add_send_input(in, frames, block, s->last_left, s->last_right, gl, gr);
+		s->last_left = gl;
+		s->last_right = gr;
+	}
 }
 
 // mixer
@@ -393,7 +478,48 @@ bool mixer::is_ancestor_of(mixer* m) {
 bool mixer::set_mixer(mixer* m) {
 	if (!m) m = g_master;
 	if (this == g_master || is_ancestor_of(m)) return false;
-	return set_parent(m);
+	std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+	// Moving under m must not close a loop through sends either: nothing this mixer's output reaches may send back into it from below.
+	sound_base* old_parent = parent;
+	set_parent(m);
+	bool loops = false;
+	for (sound_base* n = m; n && !loops; n = n->parent) {
+		for (auto& s : n->sends) {
+			if (reaches(s->target, this, 0)) {
+				loops = true;
+				break;
+			}
+		}
+	}
+	if (loops) set_parent(static_cast<mixer*>(old_parent));
+	return !loops;
+}
+// Audio thread. Adds a sender's audio, ramped between its gains, to this block's buffer, clearing the buffer first if it still holds an older block.
+void mixer::add_send_input(const float* in, int frames, uint64_t block, float from_left, float from_right, float to_left, float to_right) {
+	send_input& b = send_in[block & 1];
+	if (b.buf.empty()) return;
+	if (b.block != block) {
+		std::fill(b.buf.begin(), b.buf.end(), 0.0f);
+		b.block = block;
+		b.frames = 0;
+	}
+	// A sender inside a pitched mixer renders more or fewer frames than a block. Its send isn't resampled by that mixer, so only what fits is kept.
+	int n = std::min(frames, max_render_frames);
+	float sl = from_left, sr = from_right, dl = (to_left - from_left) / n, dr = (to_right - from_right) / n;
+	for (int f = 0; f < n; f++) {
+		sl += dl;
+		sr += dr;
+		b.buf[f * 2] += in[f * 2] * sl;
+		b.buf[f * 2 + 1] += in[f * 2 + 1] * sr;
+	}
+	b.frames = std::max(b.frames, n);
+}
+// Audio thread. Mixes in what was sent here during the previous block.
+void mixer::mix_send_input(float* acc, int frames, uint64_t block) {
+	const send_input& b = send_in[(block + 1) & 1];
+	if (b.buf.empty() || b.block + 1 != block || !b.frames) return;
+	int n = std::min(frames, b.frames);
+	for (int i = 0; i < n * 2; i++) acc[i] += b.buf[i];
 }
 void mixer::render(float* out, int frames, int depth) {
 	if (depth > 64) return; // A cycle can't be built through set_mixer, but never recurse forever.
@@ -422,9 +548,11 @@ void mixer::render(float* out, int frames, int depth) {
 		int got = resampler->ResampleOut(acc, need, frames, 2);
 		if (got < frames) memset(acc + got * 2, 0, (frames - got) * 2 * sizeof(float));
 	}
+	mix_send_input(acc, frames, now / block_frames); // Before the effects, so a reverb on this mixer works on what's sent to it.
 	process_fx(acc, frames);
 	process_ir(acc, frames, depth);
 	spatialize(acc, frames, sp, is_positioned, pos_vol, pos_pan);
+	render_sends(acc, frames, vol, pos_vol, pn, pos_pan);
 	apply_gain(acc, out, frames, vol + pos_vol, pn, pos_pan);
 }
 
@@ -970,6 +1098,7 @@ void sound::render(float* out, int frames, int depth) {
 	}
 	process_fx(st, frames);
 	spatialize(st, frames, sp, is_positioned, pos_vol, pos_pan);
+	render_sends(st, frames, vol, pos_vol, pn, pos_pan);
 	apply_gain(st, out, frames, vol + pos_vol, pn, pos_pan);
 	if (src_ended) {
 		playing = false;
@@ -1050,6 +1179,9 @@ template <class T> static void register_sound_base(asIScriptEngine* engine, cons
 	engine->RegisterObjectBehaviour(type, asBEHAVE_RELEASE, "void f()", asMETHOD(sound_base, release), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool set_position(float listener_x, float listener_y, float listener_z, float sound_x, float sound_y, float sound_z, float rotation = 0.0, float pan_step = 1.0, float volume_step = 1.0)", asMETHOD(sound_base, set_position), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool set_mixer(mixer@+ mixer = null)", asMETHOD(T, set_mixer), asCALL_THISCALL);
+	engine->RegisterObjectMethod(type, "bool set_send(mixer@+ target, float volume = 0, bool after_distance = false)", asMETHOD(sound_base, set_send), asCALL_THISCALL);
+	engine->RegisterObjectMethod(type, "bool remove_send(mixer@+ target = null)", asMETHOD(sound_base, remove_send), asCALL_THISCALL);
+	engine->RegisterObjectMethod(type, "float get_send(mixer@+ target) const", asMETHOD(sound_base, get_send), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "void set_hrtf(bool enable = true)", asMETHOD(sound_base, set_hrtf), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool get_sliding() const property", asMETHOD(sound_base, is_sliding), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool get_pan_sliding() const property", asMETHOD(sound_base, is_pan_sliding), asCALL_THISCALL);

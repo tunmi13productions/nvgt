@@ -121,6 +121,13 @@ class mixer;
 struct phonon_state;
 struct spatial_params;
 class sound_environment;
+// A send (set_send): a copy of a node's output mixed into another mixer as well as its own. The volume is atomic so the script can move it every frame without waiting on the audio thread.
+struct send_slot {
+	mixer* target;
+	std::atomic<float> volume;
+	bool after_distance;
+	float last_left = -1, last_right = -1; // The audio thread's last gains, ramped from so volume changes don't click.
+};
 // Shared by sounds and mixers: refcounting, the output mixer, volume/pan/pitch with slides, and basic positioning.
 class sound_base {
 protected:
@@ -146,6 +153,13 @@ protected:
 	void spatialize(float* frames, int count, const spatial_params& p, bool is_positioned, float& vol_db, float& pan_value);
 	void ensure_phonon();
 	spatial_params snapshot_position(bool& is_positioned); // Must be called with params_lock held.
+	// Sends. Adding or removing one takes the graph mutex as well as sends_mutex, so the audio thread can read the list while it renders; sends_mutex alone lets the script find a send to change its volume.
+	std::mutex sends_mutex;
+	std::vector<std::unique_ptr<send_slot>> sends;
+	void render_sends(const float* frames, int count, float vol_db, float position_vol_db, float pan_value, float position_pan);
+	void clear_sends();
+	friend bool reaches(sound_base* from, mixer* m, int depth);
+	friend class mixer; // set_mixer checks the sends along its new parents.
 public:
 	mixer* parent = nullptr;
 	bool set_parent(mixer* m, bool internal = false); // Moves this node within the mixer tree without the checks set_mixer does.
@@ -173,12 +187,23 @@ public:
 	int set_fx(const std::string& fx, int index = -1);
 	bool set_impulse_response(const std::string& response, float dry = 1.0f, float wet = 0.35f, const std::string& response_right = "", float spread = 1.0f);
 	bool set_impulse_response_params(float dry, float wet, float spread = 1.0f);
+	bool set_send(mixer* target, float volume = 0, bool after_distance = false);
+	bool remove_send(mixer* target = nullptr);
+	float get_send(mixer* target);
 	virtual bool set_mixer(mixer* m) = 0;
 };
 
 class mixer : public sound_base {
 	std::vector<sound_base*> children;
 	friend class sound_base;
+	// Sends into this mixer, double buffered by block: senders add to the buffer for the block being rendered, and the mixer plays the previous block's. That makes every send exactly one block late whichever order the tree renders in.
+	struct send_input {
+		std::vector<float> buf;
+		uint64_t block = 0;
+		int frames = 0;
+	} send_in[2];
+	void add_send_input(const float* in, int frames, uint64_t block, float from_left, float from_right, float to_left, float to_right);
+	void mix_send_input(float* acc, int frames, uint64_t block);
 public:
 	mixer(bool is_master = false);
 	~mixer();

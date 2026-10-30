@@ -1,0 +1,41 @@
+// NonVisual Gaming Toolkit (NVGT)
+// Copyright (C) 2022-2025 Sam Tupy
+// License: zlib (see license.md in the root of the NVGT distribution)
+
+// Listening test for sends: a sound walks away from the listener three times, dry, then sending into a shared reverb.
+
+// The reverb send level by distance that miniaudio's reverb3d used by default: about -7 to -5 dB up close, fading out by 60 units.
+float send_at(float distance) {
+	if (distance <= 7) return -7 + distance / 7 * 2;
+	float v = 1 - (distance - 7) / (60 - 7);
+	if (v < 0) v = 0;
+	return -60 + v * 55;
+}
+
+void walk(sound@ s, mixer@ room, bool send, bool after_distance) {
+	for (float x = 0; x <= 40; x += 0.25) {
+		s.set_position(0, 0, 0, x, 3, 0, 0, 1, 1);
+		if (send) s.set_send(room, send_at(x), after_distance);
+		wait(30);
+	}
+}
+
+void main() {
+	mixer room;
+	room.set_fx("freeverb:0:1:0.85:0.4:1"); // A big room with no dry signal of its own.
+	sound s;
+	if (!s.load("data/audio/sonar.ogg") && !s.load("../data/audio/sonar.ogg")) {
+		alert("Sends", "Run this from the test or test/quick folder, so data/audio/sonar.ogg can be found.");
+		return;
+	}
+	s.play_looped();
+	alert("Sends", "First the sound walks away dry, with no reverb.");
+	walk(s, room, false, false);
+	alert("Sends", "Now it sends into a shared reverb, at a level set by distance. The room should take over as the dry sound fades.");
+	walk(s, room, true, false);
+	alert("Sends", "Last, the send also follows distance attenuation, so the reverb fades away with the sound.");
+	walk(s, room, true, true);
+	s.remove_send(room);
+	s.stop();
+	wait(2000);
+}

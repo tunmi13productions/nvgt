@@ -345,6 +345,52 @@ void test_sound_effects_in_the_mix() {
 	assert(m.set_fx(""));
 }
 
+// Sends: a copy of a sound or mixer mixed into a second mixer, such as a shared reverb.
+void test_sound_sends() {
+	mixer room, other, inner;
+	room.volume = -100;
+	assert(room.set_fx("freeverb:0:1:0.6:0.5:1"));
+	sound s;
+	assert(s.load("data/audio/yfs.wav"));
+	assert(s.get_send(room) == -100); // No send yet.
+	assert(s.set_send(room, -6));
+	assert(s.get_send(room) == -6);
+	assert(s.set_send(room, -12, true)); // Changing it, rather than adding a second.
+	assert(s.get_send(room) == -12);
+	assert(s.set_send(other));
+	assert(s.get_send(other) == 0);
+	assert(!s.set_send(null));
+	assert(s.remove_send(other));
+	assert(!s.remove_send(other));
+	assert(s.get_send(other) == -100);
+	// Nothing may feed back into itself.
+	assert(!room.set_send(room));
+	assert(inner.set_mixer(room));
+	assert(!room.set_send(inner)); // inner's output is already part of room's.
+	assert(inner.set_send(room)); // A send up the tree only doubles the signal, which is allowed.
+	assert(other.set_send(inner));
+	assert(!room.set_send(other)); // room -> other -> inner, which is inside room.
+	assert(!inner.set_mixer(other)); // other already sends into inner, and moving inner under it would loop.
+	assert(other.remove_send(inner));
+	assert(room.set_send(other));
+	assert(room.remove_send());
+	// A send keeps its mixer alive after the script lets go of it.
+	{
+		mixer temp;
+		temp.volume = -100;
+		assert(s.set_send(temp, -3));
+	}
+	if (!SOUND_AVAILABLE) return;
+	assert(s.set_mixer(room)); // Silent like the rest; this checks sends run in the mix.
+	assert(s.play());
+	wait(200);
+	for (int i = 0; i < 20; i++) assert(s.set_send(room, -i)); // Moved every frame, as a distance based reverb send is.
+	timer t;
+	while (s.playing && t.elapsed < 4000) wait(10);
+	assert(!s.playing, "a sound with sends never finished");
+	assert(s.remove_send());
+}
+
 // Steam Audio. HRTF placement is checked numerically outside the engine; this checks it runs in the mix.
 void test_sound_hrtf_plays() {
 	if (!SOUND_AVAILABLE) return;
