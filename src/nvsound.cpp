@@ -553,7 +553,7 @@ void mixer::render(float* out, int frames, int depth) {
 	process_ir(acc, frames, depth);
 	spatialize(acc, frames, sp, is_positioned, pos_vol, pos_pan);
 	render_sends(acc, frames, vol, pos_vol, pn, pos_pan);
-	apply_gain(acc, out, frames, vol + pos_vol, pn, pos_pan);
+	apply_gain(acc, out, frames, vol + pos_vol + dry_volume.load(), pn, pos_pan);
 }
 
 // File and decoded data caches, so a sound loaded many times is read and decoded once. Entries nobody is using expire after a couple of minutes.
@@ -1099,7 +1099,7 @@ void sound::render(float* out, int frames, int depth) {
 	process_fx(st, frames);
 	spatialize(st, frames, sp, is_positioned, pos_vol, pos_pan);
 	render_sends(st, frames, vol, pos_vol, pn, pos_pan);
-	apply_gain(st, out, frames, vol + pos_vol, pn, pos_pan);
+	apply_gain(st, out, frames, vol + pos_vol + dry_volume.load(), pn, pos_pan);
 	if (src_ended) {
 		playing = false;
 		ended = true;
@@ -1182,6 +1182,8 @@ template <class T> static void register_sound_base(asIScriptEngine* engine, cons
 	engine->RegisterObjectMethod(type, "bool set_send(mixer@+ target, float volume = 0, bool after_distance = false)", asMETHOD(sound_base, set_send), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool remove_send(mixer@+ target = null)", asMETHOD(sound_base, remove_send), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "float get_send(mixer@+ target) const", asMETHOD(sound_base, get_send), asCALL_THISCALL);
+	engine->RegisterObjectMethod(type, "float get_dry_volume() const property", asMETHOD(sound_base, get_dry_volume), asCALL_THISCALL);
+	engine->RegisterObjectMethod(type, "void set_dry_volume(float volume) property", asMETHOD(sound_base, set_dry_volume), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "void set_hrtf(bool enable = true)", asMETHOD(sound_base, set_hrtf), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool get_sliding() const property", asMETHOD(sound_base, is_sliding), asCALL_THISCALL);
 	engine->RegisterObjectMethod(type, "bool get_pan_sliding() const property", asMETHOD(sound_base, is_pan_sliding), asCALL_THISCALL);

@@ -374,6 +374,12 @@ void test_sound_sends() {
 	assert(other.remove_send(inner));
 	assert(room.set_send(other));
 	assert(room.remove_send());
+	// dry_volume turns down a node's own output and leaves its sends alone.
+	assert(s.dry_volume == 0);
+	s.dry_volume = -100;
+	assert(s.dry_volume == -100);
+	s.dry_volume = 5;
+	assert(s.dry_volume == 0); // Clamped like volume.
 	// A send keeps its mixer alive after the script lets go of it.
 	{
 		mixer temp;

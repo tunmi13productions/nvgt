@@ -12,6 +12,7 @@
 */
 
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -156,6 +157,7 @@ protected:
 	// Sends. Adding or removing one takes the graph mutex as well as sends_mutex, so the audio thread can read the list while it renders; sends_mutex alone lets the script find a send to change its volume.
 	std::mutex sends_mutex;
 	std::vector<std::unique_ptr<send_slot>> sends;
+	std::atomic<float> dry_volume{0}; // Scales the node's own output but not its sends, for a send that should be heard in place of the dry signal.
 	void render_sends(const float* frames, int count, float vol_db, float position_vol_db, float pan_value, float position_pan);
 	void clear_sends();
 	friend bool reaches(sound_base* from, mixer* m, int depth);
@@ -190,6 +192,8 @@ public:
 	bool set_send(mixer* target, float volume = 0, bool after_distance = false);
 	bool remove_send(mixer* target = nullptr);
 	float get_send(mixer* target);
+	float get_dry_volume() { return dry_volume; }
+	void set_dry_volume(float v) { dry_volume = std::clamp(v, -100.0f, 0.0f); }
 	virtual bool set_mixer(mixer* m) = 0;
 };
 
