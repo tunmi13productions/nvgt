@@ -75,7 +75,8 @@ void add_game_asset_to_bundle(const string& path, int flags) {
 	while (semi && semi != string::npos && path[semi -1] == '\\' ) semi = path.find_first_of(';', semi + 1);
 	return add_game_asset_to_bundle(path.substr(0, semi), path.substr(semi +1 ), flags);
 }
-set<string> g_bundle_libraries = {"nvdaControllerClient64", "phonon", "SAAPI64", "zdsrapi"};
+// A library in the platform's lib folder is bundled if its name contains one of these. Prism is the speech library; on Linux it needs glib's shared libraries beside it.
+set<string> g_bundle_libraries = {"prism", "phonon", "SAAPI64", "zdsrapi", "glib-2.0", "gobject-2.0", "gio-2.0", "gmodule-2.0"};
 void nvgt_bundle_shared_library(const string& libname) {
 	g_bundle_libraries.insert(libname);
 }
