@@ -4,6 +4,10 @@ vcpkg_from_github(
   REF v0.18.3
   SHA512 a6cec5e04cf332dbe4ad75e8353559931fff6885b16f41304f73489f6dd236a8c014dc6b32f7d8c8838e4e39f2969c095403c5c8a5b8fd2218197f9eb35225fd
   HEAD_REF master
+  PATCHES
+    # std::atomic_unsigned_lock_free is new in GCC 13's library, and NVGT's Linux build stays on Ubuntu 22.04's GCC 12
+    # so that it runs on older distributions. A plain atomic unsigned is the same thing on every platform we build.
+    gcc12-atomic.patch
 )
 # Backends default to AUTO, building whatever the platform can. The two Linux backends that need libraries are switched by features, so vcpkg provides those libraries.
 set(PRISM_ORCA OFF)
