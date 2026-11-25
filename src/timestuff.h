@@ -23,6 +23,7 @@
 class CScriptArray;
 uint64_t ticks(bool secure = true);
 uint64_t microticks(bool secure = true);
+void set_virtual_clock(int64_t micros); // -1 goes back to the real clock.
 
 class timer_queue;
 class timer_queue_item : public TimerEventInterface {

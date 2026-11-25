@@ -19,6 +19,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <unordered_map>
 #include <angelscript.h>
 #include <reactphysics3d/mathematics/Vector3.h>
@@ -35,6 +36,7 @@
 #include "logging.h"
 #include "nvgt.h" // g_ScriptEngine
 #include "sound_service.h"
+#include "timestuff.h" // set_virtual_clock
 #include "UI.h" // wait
 
 namespace nvsound {
@@ -79,20 +81,91 @@ static WDL_Resampler* make_resampler() {
 	return r;
 }
 
+// One block of the master mix, the way the output device gets it. buf holds block_frames stereo frames.
+static void render_block(float* buf) {
+	memset(buf, 0, sizeof(float) * block_frames * 2);
+	{
+		std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
+		if (g_master) g_master->render(buf, block_frames, 0);
+	}
+	g_frame_clock += block_frames;
+	// Master volume was linear under BASS rather than in decibels, so it stays that way.
+	float gain = std::clamp(1.0f + g_master_volume / 100.0f, 0.0f, 1.0f);
+	for (int i = 0; i < block_frames * 2; i++) buf[i] = std::clamp(buf[i] * gain, -1.0f, 1.0f);
+}
+
 static void SDLCALL audio_callback(void*, SDL_AudioStream* stream, int additional, int) {
 	float buf[block_frames * 2];
 	for (int needed = additional / int(sizeof(float) * 2); needed > 0; needed -= block_frames) {
-		memset(buf, 0, sizeof(buf));
-		{
-			std::lock_guard<std::recursive_mutex> l(g_graph_mutex);
-			if (g_master) g_master->render(buf, block_frames, 0);
-		}
-		g_frame_clock += block_frames;
-		// Master volume was linear under BASS rather than in decibels, so it stays that way.
-		float gain = std::clamp(1.0f + g_master_volume / 100.0f, 0.0f, 1.0f);
-		for (float& s : buf) s = std::clamp(s * gain, -1.0f, 1.0f);
+		render_block(buf);
 		SDL_PutAudioStreamData(stream, buf, sizeof(buf));
 	}
+}
+
+// Offline rendering, for recording what the engine sounds like. There's no output device. The script renders blocks itself with sound_offline_render(), between its own changes, so the same script makes the same file every time. Streams are topped up before every block, so none can run dry the way they might when the feeder thread falls behind.
+static bool g_offline = false;
+static std::ofstream g_offline_file;
+static uint64_t g_offline_frames_written = 0;
+static double g_offline_owed = 0; // Frames asked for but not rendered yet, since blocks are a fixed size.
+static int64_t g_offline_clock_start = 0; // The real clock when offline mode began, in microseconds. NVGT's clock reads this plus the audio rendered since.
+
+static void write_wav_header(std::ostream& f, uint64_t frames) {
+	auto u32 = [&f](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+	auto u16 = [&f](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+	uint32_t data_bytes = uint32_t(frames * 2 * sizeof(float));
+	f.write("RIFF", 4);
+	u32(36 + data_bytes);
+	f.write("WAVEfmt ", 8);
+	u32(16);
+	u16(3); // IEEE float.
+	u16(2);
+	u32(g_sample_rate);
+	u32(g_sample_rate * 2 * sizeof(float));
+	u16(2 * sizeof(float));
+	u16(32);
+	f.write("data", 4);
+	u32(data_bytes);
+}
+static bool offline_stop() {
+	if (!g_offline_file.is_open()) return false;
+	g_offline_file.seekp(0);
+	write_wav_header(g_offline_file, g_offline_frames_written);
+	g_offline_file.close();
+	return true;
+}
+static bool offline_begin(int sample_rate) {
+	if (g_initialized || g_shut_down) return false; // Before anything starts the engine, since loaded sounds are converted to the engine's rate.
+	g_offline = true;
+	g_sample_rate = sample_rate > 0 ? sample_rate : 48000;
+	g_output_device = 0;
+	g_offline_clock_start = int64_t(microticks(false));
+	set_virtual_clock(g_offline_clock_start);
+	return init();
+}
+static bool offline_record(const std::string& path) {
+	if (!g_offline) return false;
+	offline_stop();
+	g_offline_file.open(path, std::ios::binary | std::ios::trunc);
+	if (!g_offline_file) return false;
+	g_offline_frames_written = 0;
+	write_wav_header(g_offline_file, 0);
+	return true;
+}
+static bool offline_render(double ms) {
+	if (!g_offline || !init() || ms < 0) return false;
+	g_offline_owed += ms * g_sample_rate / 1000.0;
+	float buf[block_frames * 2];
+	while (g_offline_owed >= block_frames) {
+		feed_streams_now();
+		render_block(buf);
+		g_offline_owed -= block_frames;
+		set_virtual_clock(g_offline_clock_start + int64_t(g_frame_clock * 1000000 / g_sample_rate));
+		if (g_offline_file.is_open()) {
+			g_offline_file.write(reinterpret_cast<const char*>(buf), sizeof(buf));
+			g_offline_frames_written += block_frames;
+		}
+	}
+	return true;
 }
 
 static bool open_output(unsigned int index) {
@@ -132,9 +205,10 @@ bool init() {
 	// The engine runs at the default device's own rate so nothing is resampled on the way out. Switching to a device with a different rate later lets SDL convert.
 	SDL_AudioSpec spec;
 	int frames;
-	if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &frames) && spec.freq > 0) g_sample_rate = spec.freq;
+	if (!g_offline && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &frames) && spec.freq > 0) g_sample_rate = spec.freq;
 	if (!g_master) g_master = new mixer(true);
 	g_initialized = true;
+	if (g_offline) return true;
 	if (!open_output(g_output_device)) {
 		g_output_device = 1;
 		open_output(1);
@@ -142,6 +216,7 @@ bool init() {
 	return true;
 }
 void shutdown() {
+	offline_stop();
 	release_played(true);
 	g_shut_down = true;
 	close_all_microphones();
@@ -150,13 +225,14 @@ void shutdown() {
 	stop_stream_feeder();
 	g_initialized = false;
 }
-bool is_available() { return init() && g_output_stream; }
+bool is_available() { return init() && (g_output_stream || g_offline); }
 
 float get_master_volume() { return g_master_volume; }
 void set_master_volume(float v) { g_master_volume = std::clamp(v, -100.0f, 0.0f); }
 unsigned int get_output_device() { return g_output_device; }
 bool set_output_device(unsigned int index) {
 	if (!init()) return false;
+	if (g_offline) return true; // Opening a device would render alongside the script.
 	if (!open_output(index)) {
 		open_output(g_output_device);
 		return false;
@@ -1245,6 +1321,10 @@ void RegisterNvsound(asIScriptEngine* engine) {
 	engine->RegisterObjectMethod("sound", "float get_position() const property", asMETHOD(sound, get_position), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound", "double get_pitch_lower_limit() const property", asMETHOD(sound, get_pitch_lower_limit), asCALL_THISCALL);
 	engine->RegisterGlobalFunction("bool get_SOUND_AVAILABLE() property", asFUNCTION(is_available), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool sound_offline_begin(int sample_rate = 48000)", asFUNCTION(offline_begin), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool sound_offline_record(const string&in path)", asFUNCTION(offline_record), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool sound_offline_render(double ms)", asFUNCTION(offline_render), asCALL_CDECL);
+	engine->RegisterGlobalFunction("bool sound_offline_stop()", asFUNCTION(offline_stop), asCALL_CDECL);
 	engine->RegisterGlobalFunction("float get_sound_master_volume() property", asFUNCTION(get_master_volume), asCALL_CDECL);
 	engine->RegisterGlobalFunction("void set_sound_master_volume(float volume) property", asFUNCTION(set_master_volume), asCALL_CDECL);
 	engine->RegisterGlobalFunction("uint get_sound_input_device() property", asFUNCTION(get_input_device), asCALL_CDECL);

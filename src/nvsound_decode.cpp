@@ -605,6 +605,17 @@ std::shared_ptr<source> make_stream_source(std::unique_ptr<decoder> dec, bool de
 	return s;
 }
 
+void feed_streams_now() {
+	std::vector<std::shared_ptr<stream_source>> live;
+	{
+		std::lock_guard<std::mutex> l(g_feeder_mutex);
+		for (auto& w : g_feeder_streams)
+			if (auto s = w.lock()) live.push_back(s);
+	}
+	for (auto& s : live)
+		while (s->feed(true)) {}
+}
+
 void stop_stream_feeder() {
 	{
 		std::lock_guard<std::mutex> l(g_feeder_mutex);

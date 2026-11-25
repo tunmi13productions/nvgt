@@ -115,6 +115,7 @@ void set_push_blocking(push_bytes* p);
 void abort_push_bytes(push_bytes* p);
 std::vector<float> resample_interleaved(const float* in, uint64_t frames, unsigned int channels, unsigned int rate_in, unsigned int rate_out, uint64_t& frames_out);
 void stop_stream_feeder();
+void feed_streams_now(); // Tops every feeder stream right up, on the calling thread. For offline rendering.
 
 class convolver;
 class effect;

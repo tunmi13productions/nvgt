@@ -24,6 +24,7 @@
 #include <SDL3/SDL.h>
 #include <obfuscate.h>
 #include <scriptarray.h> 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -252,13 +253,22 @@ int get_time_second() {
 }
 
 bool speedhack_protection = true;
+// While set, every tick and timer reads this instead of the real clock, in microseconds. The sound engine's offline mode moves it with the audio it renders, so a script's timers see exactly the time its sound took.
+static std::atomic<int64_t> g_virtual_clock{-1};
+void set_virtual_clock(int64_t micros) { g_virtual_clock = micros; }
 uint64_t secure_ticks() {
+	int64_t v = g_virtual_clock;
+	if (v >= 0) return uint64_t(v) / Timespan::MILLISECONDS;
 	return g_secure_clock.elapsed() / Timespan::MILLISECONDS;
 }
 uint64_t ticks(bool secure) {
+	int64_t v = g_virtual_clock;
+	if (v >= 0) return uint64_t(v) / Timespan::MILLISECONDS;
 	return (!secure ? g_clock.elapsed() : g_secure_clock.elapsed()) / Timespan::MILLISECONDS;
 }
 uint64_t microticks(bool secure) {
+	int64_t v = g_virtual_clock;
+	if (v >= 0) return uint64_t(v);
 	return !secure ? g_clock.elapsed() : g_secure_clock.elapsed();
 }
 
