@@ -133,13 +133,22 @@ static bool offline_stop() {
 	g_offline_file.close();
 	return true;
 }
-static bool offline_begin(int sample_rate) {
-	if (g_initialized || g_shut_down) return false; // Before anything starts the engine, since loaded sounds are converted to the engine's rate.
+static void start_offline(int sample_rate) {
 	g_offline = true;
 	g_sample_rate = sample_rate > 0 ? sample_rate : 48000;
 	g_output_device = 0;
 	g_offline_clock_start = int64_t(microticks(false));
 	set_virtual_clock(g_offline_clock_start);
+}
+// A script whose globals make sounds starts the engine before main() runs, too early for sound_offline_begin(). The NVGT_SOUND_OFFLINE environment variable, set to a sample rate, makes the engine start offline instead.
+static void check_offline_environment() {
+	const char* rate = SDL_getenv("NVGT_SOUND_OFFLINE");
+	if (rate && *rate && !g_offline) start_offline(SDL_atoi(rate));
+}
+static bool offline_begin(int sample_rate) {
+	if (g_offline) return true;
+	if (g_initialized || g_shut_down) return false; // Before anything starts the engine, since loaded sounds are converted to the engine's rate.
+	start_offline(sample_rate);
 	return init();
 }
 static bool offline_record(const std::string& path) {
@@ -198,6 +207,7 @@ static bool open_output(unsigned int index) {
 bool init() {
 	if (g_initialized) return true;
 	if (g_shut_down) return false;
+	check_offline_environment();
 	if (!(SDL_WasInit(0) & SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		NVGT_ERROR("nvgt.sound", Poco::format("could not start audio: %s", std::string(SDL_GetError())));
 		return false;
