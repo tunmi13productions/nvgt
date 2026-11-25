@@ -57,3 +57,6 @@ compile_commands.json
 
 # Generated engine dumps.
 other/nvgtexport/
+
+# The nvsound core's own CMake test build.
+build/nvsound_core/
