@@ -94,7 +94,7 @@ public:
 		if (index != 0xffffffff) {
 			int count = 0;
 			SDL_AudioDeviceID* devs = SDL_GetAudioRecordingDevices(&count);
-			if (devs && int(index) < count) dev = devs[index];
+			if (devs && count > 0 && index < unsigned(count)) dev = devs[index];
 			SDL_free(devs);
 			if (dev == SDL_AUDIO_DEVICE_DEFAULT_RECORDING && device >= 0) return false;
 		}

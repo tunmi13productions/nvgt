@@ -107,7 +107,8 @@ static bool open_output(unsigned int index) {
 		int count = 0;
 		SDL_AudioDeviceID* devs = SDL_GetAudioPlaybackDevices(&count);
 		if (!devs) return false;
-		if (int(index - 2) < count) dev = devs[index - 2];
+		// Unsigned compare, so a script passing -1 (0xffffffff) can't index before the array.
+		if (count > 0 && index - 2 < unsigned(count)) dev = devs[index - 2];
 		SDL_free(devs);
 		if (dev == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) return false;
 	}
