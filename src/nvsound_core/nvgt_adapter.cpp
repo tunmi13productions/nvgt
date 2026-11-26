@@ -14,6 +14,8 @@
 #include "core.h"
 #include "realtime.h"
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 #include <angelscript.h>
 #include <reactphysics3d/mathematics/Vector3.h>
 #include <scriptarray.h>
@@ -205,6 +207,19 @@ template <class T> static void register_sound_base(asIScriptEngine* engine, cons
 
 void RegisterNvsound(asIScriptEngine* engine) {
 	set_host(std::make_unique<nvgt_host>());
+#ifdef NVSOUND_COUNT_ALLOCS
+	// Proves the counter sees allocations in this build: one made on purpose while marked as the audio thread must be counted.
+	{
+		size_t before = audio_thread_alloc_count();
+		{
+			audio_scope scope;
+			delete new int(1);
+		}
+		bool works = audio_thread_alloc_count() == before + 1;
+		reset_audio_thread_counts();
+		if (getenv("NVSOUND_REPORT")) fprintf(stderr, "nvsound allocation counter %s\n", works ? "works" : "DOES NOT WORK");
+	}
+#endif
 	// Default arguments are resolved from the script's namespace, so name our own sound_default_pack explicitly or a global one of the same name wins.
 	std::string ns = engine->GetDefaultNamespace();
 	std::string default_pack = ns.empty() ? "sound_default_pack" : ns + "::sound_default_pack";

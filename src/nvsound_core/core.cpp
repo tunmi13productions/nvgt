@@ -640,6 +640,8 @@ bool init() {
 	int frames;
 	if (!g_offline && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &frames) && spec.freq > 0) g_sample_rate = spec.freq;
 	prepare_scratch();
+	// Streams and push sources read without locks, retiring what they finish with here.
+	use_lockfree_sources([](void* object, void (*destroy)(void*)) { retire(retired{object, destroy}); });
 	g_initialized = true;
 	if (!g_master) g_master = new mixer(true);
 	if (g_offline) return true;

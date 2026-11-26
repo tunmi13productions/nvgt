@@ -63,7 +63,9 @@ The response is built on a worker or the script thread. The convolver's `set_ir(
 
 ## Streams
 
-The feeder's ring becomes a lock-free single-producer, single-consumer ring, and the audio thread no longer takes `ring_mutex` to read. A seek is a command. The audio thread bumps the ring's generation and asks the feeder to seek the decoder, and frames from before the seek are skipped. In offline mode `feed_streams_now()` still tops every stream up before each block, so renders stay exact.
+The feeder's ring becomes a lock-free ring with one writer (whoever feeds, under the decoder's mutex, which only feeders and the script take) and one reader (the audio thread). A seek can't reset a ring the audio thread may be reading, so it fills a fresh ring and hands it over, and the audio thread switches to it at its next read and retires the old one. The new ring is filled straight away, as today's is after a seek. In offline mode `feed_streams_now()` still tops every stream up before each block, so renders stay exact.
+
+Push sources (voice chat, speech, `push_memory` with a sample rate) get the same treatment: chunks in a linked queue only producers lock, walked by the audio thread, which retires the chunks it finishes. `clear()` becomes a request the audio thread carries out, fading out what was waiting over the fade length and dropping the rest.
 
 ## The device
 
@@ -96,7 +98,7 @@ Everything the core needs from whoever embeds it is one `host` interface: cache 
 1. The command queue, the garbage ring and the status block, with unit tests that check the audio side never takes a lock or allocates. Done.
 2. Nodes, mixers, the render path, and parameters and slides, moved from today's code. The engine scenes `dry`, `pan`, `volume`, `pitch`, `slides` and `position` must match. Done: NVGT builds on the new core with `nvsound_core=1`, and those six renders are byte for byte the same as today's core.
 3. Effects, convolution, HRTF and sends. `lowpass`, `cuts`, `freeverb`, `plate`, `convolution`, `hrtf` and `sends` must match. Done: all 20 references, the five map walks included, are byte for byte the same as today's core. A checking build (`nvsound_count_allocs=1`, with `NVSOUND_REPORT` set) counted no locks and no allocations on the audio thread across all of them. Its lock count only sees the core's own mutex type. The stream ring's `std::mutex`, which the audio thread still takes to read a stream, is step 4.
-4. Streams and the lock-free ring. `stream` and `crowd` must match.
+4. Streams and the lock-free ring. `stream` and `crowd` must match. Done, with push sources too: both have lock-free versions in `nvsound_decode.cpp` that only the new core asks for (`use_lockfree_sources`), so today's core keeps its own. A seek fills a fresh ring and hands it over. Push chunks go in a queue only producers lock, and `clear()`'s fade is done by the audio thread. A `push` scene joined the references. All 21 match, and the checking build, whose allocation counter now proves itself at startup, counted no locks or allocations on the audio thread. `clear()` isn't covered by a reference, since scripts can't call it. Speech uses it.
 5. The NVGT adapter, so all 20 references can run, the map walks included. Started early, in step 2, since it's how the renders are compared.
 6. The device and microphone, and the failures in the error logs: switching or losing devices, the Default device, an impulse response loading while sound plays, many notes at once, and sounds piling up across map changes.
 7. nanobind.

@@ -413,8 +413,23 @@ public:
 	void set_loop(bool l) override { loop = l; }
 };
 
+// Anything the stream feeder tops up.
+class feedable {
+public:
+	virtual ~feedable() {}
+	virtual bool feed(bool blocking = false) = 0;
+};
+
+// The new core's audio thread takes no locks, so it asks for the lock-free sources below instead. retire hands the audio thread's leftovers to whoever frees them.
+static bool g_lockfree_sources = false;
+static void (*g_retire)(void* object, void (*destroy)(void*)) = nullptr;
+void use_lockfree_sources(void (*retire)(void* object, void (*destroy)(void*))) {
+	g_lockfree_sources = true;
+	g_retire = retire;
+}
+
 // Streams decode on a background thread into a ring buffer, so the audio thread never waits on a file read or a slow decode.
-class stream_source : public source {
+class stream_source : public source, public feedable {
 	std::unique_ptr<decoder> dec;
 	std::mutex dec_mutex; // Owned by whoever is touching the decoder: a feeding thread, or a seek from the script thread.
 	std::mutex ring_mutex;
@@ -472,7 +487,7 @@ public:
 	unsigned int channels() const override { return ch; }
 	unsigned int sample_rate() const override { return rate; }
 	// Decodes one chunk if there is room. Returns true if it did anything, so a feeding thread knows whether to sleep.
-	bool feed(bool blocking = false) {
+	bool feed(bool blocking = false) override {
 		std::unique_lock<std::mutex> dl(dec_mutex, std::defer_lock);
 		if (blocking) dl.lock();
 		else if (!dl.try_lock()) return false;
@@ -558,12 +573,12 @@ public:
 // One thread services every ordinary stream, topping each ring up in turn.
 static std::mutex g_feeder_mutex;
 static std::condition_variable g_feeder_cv;
-static std::vector<std::weak_ptr<stream_source>> g_feeder_streams;
+static std::vector<std::weak_ptr<feedable>> g_feeder_streams;
 static std::thread g_feeder_thread;
 static bool g_feeder_stop = false;
 
 static void feeder_loop() {
-	std::vector<std::shared_ptr<stream_source>> live;
+	std::vector<std::shared_ptr<feedable>> live;
 	while (true) {
 		{
 			std::lock_guard<std::mutex> l(g_feeder_mutex);
@@ -587,7 +602,175 @@ static void feeder_loop() {
 	}
 }
 
+// The same stream without locks on the reading side. The ring's positions are atomics with one writer and one reader: whoever feeds (under dec_mutex, which only feeders and the script wait on) and the audio thread. A seek can't reset a ring the audio thread may be reading, so it fills a fresh one and hands it over. The audio thread switches at its next read, and retires the old ring.
+class lockfree_stream_source : public source, public feedable {
+	struct ring_t {
+		std::vector<float> data;
+		uint64_t capacity;
+		std::atomic<uint64_t> written{0}, read{0}; // Frames, ever. Only the feeder moves written, and only the audio thread moves read.
+		std::atomic<int64_t> end_pos{0}; // The decoder position at the end of the newest frame written.
+		std::atomic<bool> eof{false};
+		ring_t(uint64_t frames, unsigned int ch) : data(size_t(frames) * ch, 0.0f), capacity(frames) {}
+	};
+	std::unique_ptr<decoder> dec;
+	std::mutex dec_mutex; // Only feeders and the script take this, never the audio thread.
+	ring_t* feeding; // The ring the feeder writes. Under dec_mutex.
+	ring_t* playing; // The ring the audio thread reads. Audio thread only.
+	std::atomic<ring_t*> handover{nullptr}; // A fresh ring after a seek, until the audio thread takes it.
+	std::atomic<bool> loop{false};
+	uint64_t len;
+	unsigned int ch, rate;
+	bool dedicated;
+	std::function<void()> abort;
+	std::thread thread;
+	std::atomic<bool> stopping{false};
+	std::mutex wake_mutex;
+	std::condition_variable wake;
+	ring_t* new_ring() { return new ring_t(std::max<uint64_t>(rate, 16384), ch); } // About a second of audio.
+	void thread_loop() {
+		while (!stopping) {
+			if (feed(true)) continue;
+			std::unique_lock<std::mutex> l(wake_mutex);
+			wake.wait_for(l, std::chrono::milliseconds(10), [this] { return stopping.load(); });
+		}
+	}
+public:
+	lockfree_stream_source(std::unique_ptr<decoder> d, bool dedicated, std::function<void()> abort) : dec(std::move(d)), dedicated(dedicated), abort(std::move(abort)) {
+		ch = dec->channels;
+		rate = dec->sample_rate;
+		len = dedicated ? 0 : dec->length(); // Asking a network or pushed stream for its length could mean reading all of it.
+		feeding = playing = new_ring();
+	}
+	~lockfree_stream_source() {
+		if (thread.joinable()) {
+			stopping = true;
+			if (abort) abort(); // Frees the thread if it is waiting inside a read.
+			wake.notify_one();
+			thread.join();
+		}
+		// Nothing reads this source any more, since the audio thread's reference went before this one.
+		ring_t* h = handover.exchange(nullptr);
+		if (h && h != feeding && h != playing) delete h;
+		if (feeding != playing) delete feeding;
+		delete playing;
+	}
+	void start_thread() { thread = std::thread(&lockfree_stream_source::thread_loop, this); }
+	unsigned int channels() const override { return ch; }
+	unsigned int sample_rate() const override { return rate; }
+	// Decodes one chunk if there is room. Returns true if it did anything, so a feeding thread knows whether to sleep.
+	bool feed(bool blocking = false) override {
+		std::unique_lock<std::mutex> dl(dec_mutex, std::defer_lock);
+		if (blocking) dl.lock();
+		else if (!dl.try_lock()) return false;
+		ring_t& r = *feeding;
+		if (r.eof || stopping) return false;
+		uint64_t w = r.written.load(std::memory_order_relaxed);
+		uint64_t space = r.capacity - (w - r.read.load(std::memory_order_acquire));
+		if (space < 1024) return false;
+		uint64_t want = std::min<uint64_t>(space, 4096);
+		thread_local std::vector<float> tmp;
+		tmp.resize(want * ch);
+		uint64_t got = dec->read(tmp.data(), want);
+		if (got == 0) {
+			// end_pos of 0 means nothing was decoded since the last wrap, so this stream is empty and looping it would spin forever.
+			if (loop && !dedicated && r.end_pos.load() > 0 && dec->seek(0)) {
+				r.end_pos = 0;
+				return true;
+			}
+			r.eof = true;
+			return false;
+		}
+		for (uint64_t done = 0; done < got;) {
+			uint64_t at = (w + done) % r.capacity;
+			uint64_t n = std::min(got - done, r.capacity - at);
+			memcpy(r.data.data() + at * ch, tmp.data() + done * ch, n * ch * sizeof(float));
+			done += n;
+		}
+		r.end_pos += int64_t(got);
+		r.written.store(w + got, std::memory_order_release);
+		return true;
+	}
+	void prefill(uint64_t frames) {
+		uint64_t start = 0;
+		while (start < frames && feed(true)) {
+			std::lock_guard<std::mutex> l(dec_mutex);
+			start = feeding->written - feeding->read;
+		}
+	}
+	uint64_t read(float* out, uint64_t frames, bool& ended) override {
+		if (ring_t* fresh = handover.exchange(nullptr, std::memory_order_acq_rel)) {
+			if (g_retire) g_retire(playing, [](void* p) { delete static_cast<ring_t*>(p); });
+			playing = fresh;
+		}
+		ring_t& r = *playing;
+		uint64_t rd = r.read.load(std::memory_order_relaxed);
+		uint64_t n = std::min(frames, r.written.load(std::memory_order_acquire) - rd);
+		for (uint64_t done = 0; done < n;) {
+			uint64_t at = (rd + done) % r.capacity;
+			uint64_t c = std::min(n - done, r.capacity - at);
+			memcpy(out + done * ch, r.data.data() + at * ch, c * ch * sizeof(float));
+			done += c;
+		}
+		r.read.store(rd + n, std::memory_order_release);
+		if (n < frames) {
+			memset(out + n * ch, 0, (frames - n) * ch * sizeof(float));
+			// Running dry before the end is an underrun, which plays as silence. Running dry after the end is the end.
+			if (r.eof) ended = true;
+		}
+		return frames;
+	}
+	bool seek(uint64_t frame) override {
+		if (dedicated) return false; // Its thread may be waiting inside the decoder, and a socket can't rewind anyway.
+		{
+			std::lock_guard<std::mutex> dl(dec_mutex);
+			if (!dec->seek(frame)) return false;
+			ring_t* fresh = new_ring();
+			fresh->end_pos = int64_t(frame);
+			feeding = fresh;
+			// A ring from an earlier seek the audio thread never took is nobody's now.
+			if (ring_t* unused = handover.exchange(fresh, std::memory_order_acq_rel)) delete unused;
+		}
+		prefill(rate / 10); // Without this the sound would play silence after a seek until the feeder next came around.
+		return true;
+	}
+	// From the feeding ring: after a seek the audio thread hasn't caught up with, nothing of it has been read yet, which is the right answer.
+	uint64_t position() override {
+		std::lock_guard<std::mutex> dl(dec_mutex);
+		int64_t p = feeding->end_pos - int64_t(feeding->written - feeding->read);
+		if (p < 0 && len > 0) p += len; // The ring still holds audio from before a loop wrapped around.
+		return p < 0 ? 0 : uint64_t(p);
+	}
+	uint64_t length() override { return len; }
+	void set_loop(bool l) override {
+		loop = l;
+		// A stream that hit the end can start feeding again once it is asked to loop.
+		if (l && !dedicated) {
+			std::lock_guard<std::mutex> dl(dec_mutex);
+			if (feeding->eof && dec->seek(0)) {
+				feeding->end_pos = 0;
+				feeding->eof = false;
+			}
+		}
+	}
+};
+
 std::shared_ptr<source> make_stream_source(std::unique_ptr<decoder> dec, bool dedicated_thread, std::function<void()> abort, uint64_t prefill_frames) {
+	if (g_lockfree_sources) {
+		auto s = std::make_shared<lockfree_stream_source>(std::move(dec), dedicated_thread, std::move(abort));
+		s->prefill(prefill_frames == ~uint64_t(0) ? s->sample_rate() / 4 : prefill_frames);
+		if (dedicated_thread) {
+			s->start_thread();
+			return s;
+		}
+		std::lock_guard<std::mutex> l(g_feeder_mutex);
+		g_feeder_streams.push_back(s);
+		if (!g_feeder_thread.joinable()) {
+			g_feeder_stop = false;
+			g_feeder_thread = std::thread(feeder_loop);
+		}
+		g_feeder_cv.notify_one();
+		return s;
+	}
 	auto s = std::make_shared<stream_source>(std::move(dec), dedicated_thread, std::move(abort));
 	// A quarter second up front by default, so playback can start the moment it is asked to.
 	s->prefill(prefill_frames == ~uint64_t(0) ? s->sample_rate() / 4 : prefill_frames);
@@ -606,7 +789,7 @@ std::shared_ptr<source> make_stream_source(std::unique_ptr<decoder> dec, bool de
 }
 
 void feed_streams_now() {
-	std::vector<std::shared_ptr<stream_source>> live;
+	std::vector<std::shared_ptr<feedable>> live;
 	{
 		std::lock_guard<std::mutex> l(g_feeder_mutex);
 		for (auto& w : g_feeder_streams)
@@ -626,7 +809,16 @@ void stop_stream_feeder() {
 }
 
 // Pushed PCM arrives in chunks of whatever size the script pushes. Each push is copied before taking the lock, so the audio thread only ever waits for a vector to be moved.
+// Raw float PCM pushed by a script or by voice and speech code.
 class pcm_push_source : public source {
+public:
+	virtual void push(const float* samples, size_t count) = 0;
+	virtual void end() = 0;
+	virtual void clear(uint64_t fade_frames) = 0;
+	virtual uint64_t queued() = 0;
+};
+
+class locked_pcm_push_source : public pcm_push_source {
 	std::mutex m;
 	std::deque<std::vector<float>> chunks;
 	size_t front_pos = 0; // Samples already played from the front chunk.
@@ -634,8 +826,8 @@ class pcm_push_source : public source {
 	bool ending = false;
 	unsigned int ch, rate;
 public:
-	pcm_push_source(unsigned int rate, unsigned int channels) : ch(channels), rate(rate) {}
-	void push(const float* samples, size_t count) {
+	locked_pcm_push_source(unsigned int rate, unsigned int channels) : ch(channels), rate(rate) {}
+	void push(const float* samples, size_t count) override {
 		count -= count % ch; // A partial frame can't be played.
 		if (!count) return;
 		std::vector<float> chunk(samples, samples + count);
@@ -643,12 +835,12 @@ public:
 		chunks.push_back(std::move(chunk));
 		buffered += count / ch;
 	}
-	void end() {
+	void end() override {
 		std::lock_guard<std::mutex> l(m);
 		ending = true;
 	}
 	// Keeps only the next fade_frames of what is waiting, faded out to silence, so stopping mid-word doesn't click.
-	void clear(uint64_t fade_frames) {
+	void clear(uint64_t fade_frames) override {
 		std::lock_guard<std::mutex> l(m);
 		std::vector<float> tail;
 		tail.reserve(std::min<uint64_t>(fade_frames, buffered) * ch);
@@ -667,7 +859,7 @@ public:
 		buffered = frames;
 		if (frames) chunks.push_back(std::move(tail));
 	}
-	uint64_t queued() {
+	uint64_t queued() override {
 		std::lock_guard<std::mutex> l(m);
 		return buffered;
 	}
@@ -707,7 +899,130 @@ public:
 	}
 	void set_loop(bool) override {}
 };
-std::shared_ptr<pcm_push_source> make_pcm_push_source(unsigned int sample_rate, unsigned int channels) { return std::make_shared<pcm_push_source>(sample_rate, channels); }
+// The same without the audio thread ever waiting: pushes are chunks in a linked queue that only producers lock, and the audio thread walks it, retiring chunks it has finished. clear() is a request the audio thread carries out itself: it fades out what was waiting at the time over fade_frames, then drops the rest, as today's does.
+class lockfree_pcm_push_source : public pcm_push_source {
+	struct chunk {
+		std::vector<float> samples;
+		std::atomic<chunk*> next{nullptr};
+	};
+	std::mutex producers; // Only pushers take this.
+	chunk* tail; // Producers only.
+	chunk* head; // The audio thread's: a chunk already used up, whose next is the one playing.
+	size_t front_pos = 0; // Samples already played from head->next. Audio thread only.
+	std::atomic<uint64_t> pushed{0}, consumed{0}, dropped{0}; // Frames, ever.
+	std::atomic<bool> ending{false};
+	// A clear request, and what the audio thread is doing about the latest one.
+	std::atomic<uint64_t> clear_at{0}, clear_fade{0};
+	std::atomic<uint32_t> clear_seq{0}, clear_done{0};
+	uint64_t fade_left = 0, fade_total = 0, skip_left = 0; // Audio thread only.
+	std::atomic<uint64_t> skip_pending{0};
+	unsigned int ch, rate;
+	// Moves past n frames of the queue, copying them to out unless it's null. Returns how many there were.
+	uint64_t take(float* out, uint64_t frames) {
+		uint64_t done = 0;
+		while (done < frames) {
+			chunk* c = head->next.load(std::memory_order_acquire);
+			if (!c) break;
+			size_t n = std::min<size_t>((frames - done) * ch, c->samples.size() - front_pos);
+			if (out) memcpy(out + done * ch, c->samples.data() + front_pos, n * sizeof(float));
+			front_pos += n;
+			done += n / ch;
+			if (front_pos >= c->samples.size()) {
+				if (g_retire) g_retire(head, [](void* p) { delete static_cast<chunk*>(p); });
+				head = c;
+				front_pos = 0;
+			}
+		}
+		return done;
+	}
+public:
+	lockfree_pcm_push_source(unsigned int rate, unsigned int channels) : ch(channels), rate(rate) { head = tail = new chunk(); }
+	~lockfree_pcm_push_source() {
+		for (chunk* c = head; c;) {
+			chunk* next = c->next.load();
+			delete c;
+			c = next;
+		}
+	}
+	void push(const float* samples, size_t count) override {
+		count -= count % ch; // A partial frame can't be played.
+		if (!count) return;
+		chunk* c = new chunk();
+		c->samples.assign(samples, samples + count);
+		std::lock_guard<std::mutex> l(producers);
+		tail->next.store(c, std::memory_order_release);
+		tail = c;
+		pushed += count / ch;
+	}
+	void end() override { ending = true; }
+	void clear(uint64_t fade_frames) override {
+		std::lock_guard<std::mutex> l(producers);
+		clear_at = pushed.load();
+		clear_fade = fade_frames;
+		clear_seq.fetch_add(1, std::memory_order_release);
+	}
+	uint64_t queued() override {
+		uint64_t p = pushed, c = consumed, d = dropped;
+		if (clear_done != clear_seq) {
+			// The audio thread hasn't seen the clear yet. What will be left is the fade, then anything pushed since.
+			uint64_t before = clear_at > c + d ? clear_at - c - d : 0;
+			return std::min<uint64_t>(clear_fade, before) + (p - std::min<uint64_t>(p, clear_at));
+		}
+		uint64_t waiting = p - c - d;
+		uint64_t skip = skip_pending;
+		return waiting > skip ? waiting - skip : 0;
+	}
+	unsigned int channels() const override { return ch; }
+	unsigned int sample_rate() const override { return rate; }
+	uint64_t read(float* out, uint64_t frames, bool& ended) override {
+		uint32_t seq = clear_seq.load(std::memory_order_acquire);
+		if (seq != clear_done.load(std::memory_order_relaxed)) {
+			uint64_t before = clear_at - std::min<uint64_t>(clear_at, consumed + dropped);
+			fade_total = fade_left = std::min<uint64_t>(clear_fade, before);
+			skip_left = before - fade_left;
+			skip_pending = skip_left;
+			clear_done.store(seq, std::memory_order_release);
+		}
+		uint64_t done = 0;
+		if (fade_left) {
+			// Keeps only the next fade_frames of what was waiting, faded out to silence, so stopping mid-word doesn't click.
+			uint64_t n = take(out, std::min(frames, fade_left));
+			for (uint64_t f = 0; f < n; f++) {
+				float g = 1.0f - float(fade_total - fade_left + f + 1) / float(fade_total);
+				for (unsigned int c = 0; c < ch; c++) out[f * ch + c] *= g;
+			}
+			fade_left -= n;
+			done += n;
+			consumed += n;
+		}
+		if (!fade_left && skip_left) {
+			uint64_t n = take(nullptr, skip_left);
+			skip_left -= n;
+			skip_pending = skip_left;
+			dropped += n;
+		}
+		if (!fade_left && !skip_left && done < frames) {
+			uint64_t n = take(out + done * ch, frames - done);
+			done += n;
+			consumed += n;
+		}
+		if (done < frames) {
+			memset(out + done * ch, 0, (frames - done) * ch * sizeof(float));
+			if (ending && !head->next.load(std::memory_order_acquire)) ended = true; // Otherwise the script just hasn't pushed more yet, and we play silence until it does.
+		}
+		return frames;
+	}
+	bool seek(uint64_t) override { return false; }
+	uint64_t position() override { return consumed; }
+	// Under BASS a push stream's length was however much audio was waiting to be played.
+	uint64_t length() override { return queued(); }
+	void set_loop(bool) override {}
+};
+
+std::shared_ptr<pcm_push_source> make_pcm_push_source(unsigned int sample_rate, unsigned int channels) {
+	if (g_lockfree_sources) return std::make_shared<lockfree_pcm_push_source>(sample_rate, channels);
+	return std::make_shared<locked_pcm_push_source>(sample_rate, channels);
+}
 void pcm_push(pcm_push_source* s, const float* samples, size_t count) { s->push(samples, count); }
 void pcm_push_end(pcm_push_source* s) { s->end(); }
 void pcm_push_clear(pcm_push_source* s, uint64_t fade_frames) { s->clear(fade_frames); }

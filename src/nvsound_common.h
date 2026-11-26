@@ -117,6 +117,8 @@ void abort_push_bytes(push_bytes* p);
 std::vector<float> resample_interleaved(const float* in, uint64_t frames, unsigned int channels, unsigned int rate_in, unsigned int rate_out, uint64_t& frames_out);
 void stop_stream_feeder();
 void feed_streams_now(); // Tops every feeder stream right up, on the calling thread. For offline rendering.
+// Makes new streams and push sources lock-free on the reading side, for a core whose audio thread never waits. retire is how the audio thread hands back what it's finished with.
+void use_lockfree_sources(void (*retire)(void* object, void (*destroy)(void*)));
 
 // Provided by whichever core is built.
 bool init();
