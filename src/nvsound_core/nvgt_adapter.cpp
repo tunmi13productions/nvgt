@@ -284,6 +284,11 @@ void RegisterNvsound(asIScriptEngine* engine) {
 	engine->RegisterGlobalFunction("void set_sound_netstream_buffer_size(uint bytes) property", asFUNCTION(set_netstream_buffer_size), asCALL_CDECL);
 	engine->RegisterGlobalFunction("uint get_sound_netstream_buffer_size() property", asFUNCTION(get_netstream_buffer_size), asCALL_CDECL);
 	engine->RegisterGlobalFunction("uint get_sound_netstream_buffered() property", asFUNCTION(get_netstream_buffered), asCALL_CDECL);
+#ifdef NVSOUND_COUNT_ALLOCS
+	// For the checking build's tests only.
+	engine->RegisterGlobalFunction("void sound_simulate_device_loss()", asFUNCTION(simulate_output_device_loss), asCALL_CDECL);
+	engine->RegisterGlobalFunction("int64 sound_live_nodes()", asFUNCTION(live_node_count), asCALL_CDECL);
+#endif
 }
 
 // Item 3 brings sound_environment back. Golden Crayon doesn't use it.

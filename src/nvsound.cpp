@@ -37,6 +37,7 @@
 #include "nvgt.h" // g_ScriptEngine
 #include "sound_service.h"
 #include "timestuff.h" // set_virtual_clock
+#include "nvsound_timing.h"
 #include "UI.h" // wait
 
 namespace nvsound {
@@ -94,12 +95,16 @@ static void render_block(float* buf) {
 	for (int i = 0; i < block_frames * 2; i++) buf[i] = std::clamp(buf[i] * gain, -1.0f, 1.0f);
 }
 
+static callback_timing g_timing;
 static void SDLCALL audio_callback(void*, SDL_AudioStream* stream, int additional, int) {
+	auto start = std::chrono::steady_clock::now();
 	float buf[block_frames * 2];
-	for (int needed = additional / int(sizeof(float) * 2); needed > 0; needed -= block_frames) {
+	int asked = additional / int(sizeof(float) * 2);
+	for (int needed = asked; needed > 0; needed -= block_frames) {
 		render_block(buf);
 		SDL_PutAudioStreamData(stream, buf, sizeof(buf));
 	}
+	g_timing.record(std::chrono::steady_clock::now() - start, uint64_t(asked), g_sample_rate);
 }
 
 // Offline rendering, for recording what the engine sounds like. There's no output device. The script renders blocks itself with sound_offline_render(), between its own changes, so the same script makes the same file every time. Streams are topped up before every block, so none can run dry the way they might when the feeder thread falls behind.
@@ -227,6 +232,7 @@ bool init() {
 }
 void shutdown() {
 	offline_stop();
+	if (SDL_getenv("NVSOUND_REPORT")) g_timing.report("today's core");
 	release_played(true);
 	g_shut_down = true;
 	close_all_microphones();

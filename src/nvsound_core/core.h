@@ -221,5 +221,8 @@ void set_decryption_key(const std::string& key);
 
 // Deletes what the audio thread has finished with. Run on a timer by the engine, and at times by script calls, so it never piles up.
 size_t collect_garbage();
+// Checking builds only: behaves as if the output device had been unplugged.
+void simulate_output_device_loss();
+int64_t live_node_count();
 
 } // namespace nvsound

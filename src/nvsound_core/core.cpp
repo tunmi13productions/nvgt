@@ -16,6 +16,7 @@
 #include "../nvsound_convolver.h"
 #include "../nvsound_effects.h"
 #include "../nvsound_phonon.h"
+#include "../nvsound_timing.h"
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
@@ -75,8 +76,11 @@ host& get_host() {
 	return *g_host;
 }
 
+// Sounds and mixers that exist, made and not yet collected. A count that keeps climbing is sounds piling up.
+static std::atomic<int64_t> g_live_nodes{0};
 // Runs on a script thread, when the node is collected. Whatever is still attached belongs to the node alone by then.
 node::~node() {
+	g_live_nodes--;
 	delete resampler;
 	delete src;
 	if (fx) {
@@ -509,12 +513,16 @@ static void render_block(float* buf) {
 	float gain = std::clamp(1.0f + g_master_volume / 100.0f, 0.0f, 1.0f);
 	for (int i = 0; i < block_frames * 2; i++) buf[i] = std::clamp(buf[i] * gain, -1.0f, 1.0f);
 }
+static callback_timing g_timing;
 static void SDLCALL audio_callback(void*, SDL_AudioStream* stream, int additional, int) {
+	auto start = std::chrono::steady_clock::now();
 	float buf[block_frames * 2];
-	for (int needed = additional / int(sizeof(float) * 2); needed > 0; needed -= block_frames) {
+	int asked = additional / int(sizeof(float) * 2);
+	for (int needed = asked; needed > 0; needed -= block_frames) {
 		render_block(buf);
 		SDL_PutAudioStreamData(stream, buf, sizeof(buf));
 	}
+	g_timing.record(std::chrono::steady_clock::now() - start, uint64_t(asked), g_sample_rate);
 }
 
 // Offline rendering. The script renders blocks itself between its own changes, so the same script makes the same file every time.
@@ -587,12 +595,21 @@ bool offline_render(double ms) {
 	return true;
 }
 
-// The device.
+// The device. Opening and closing it are serialised by g_device_mutex, which only script threads and the janitor take, never the audio thread.
+static std::mutex g_device_mutex;
+static std::atomic<SDL_AudioDeviceID> g_output_device_id{0}; // The logical device the stream plays to, for noticing when it's gone.
+static std::atomic<bool> g_device_lost{false};
+// SDL calls this from whichever thread posts an event. It only raises a flag, which the janitor acts on.
+static bool SDLCALL watch_audio_events(void*, SDL_Event* e) {
+	if (e->type == SDL_EVENT_AUDIO_DEVICE_REMOVED && !e->adevice.recording && e->adevice.which != 0 && e->adevice.which == g_output_device_id.load()) g_device_lost = true;
+	return true;
+}
 static bool open_output(unsigned int index) {
 	// Destroying the stream waits for its callback to finish. No lock is held here, so that can't deadlock.
 	if (g_output_stream) {
 		SDL_DestroyAudioStream(g_output_stream);
 		g_output_stream = nullptr;
+		g_output_device_id = 0;
 	}
 	if (index == 0) return true;
 	SDL_AudioDeviceID dev = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
@@ -611,6 +628,7 @@ static bool open_output(unsigned int index) {
 		get_host().log_error(std::string("could not open the audio output device: ") + SDL_GetError());
 		return false;
 	}
+	g_output_device_id = SDL_GetAudioStreamDevice(g_output_stream);
 	SDL_ResumeAudioStreamDevice(g_output_stream);
 	return true;
 }
@@ -620,6 +638,12 @@ static std::thread g_janitor;
 static std::atomic<bool> g_janitor_stop{false};
 static void janitor_loop() {
 	while (!g_janitor_stop) {
+		if (g_device_lost.exchange(false)) {
+			// A chosen device that disappears, unplugged headphones say, goes back to the system default rather than leaving the game silent. A stream on the default device follows the default by itself and never gets here.
+			std::lock_guard<std::mutex> l(g_device_mutex);
+			get_host().log_error("the audio output device was lost, so sound has moved to the default device");
+			if (open_output(1)) g_output_device = 1;
+		}
 		collect_garbage();
 		g_commands.reserve_for_consumer();
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -647,6 +671,8 @@ bool init() {
 	if (g_offline) return true;
 	g_janitor_stop = false;
 	g_janitor = std::thread(janitor_loop);
+	SDL_AddEventWatch(watch_audio_events, nullptr);
+	std::lock_guard<std::mutex> l(g_device_mutex);
 	if (!open_output(g_output_device)) {
 		g_output_device = 1;
 		open_output(1);
@@ -659,18 +685,32 @@ void shutdown() {
 #ifndef NVSOUND_STANDALONE
 	close_all_microphones();
 #endif
-	if (g_output_stream) SDL_DestroyAudioStream(g_output_stream);
-	g_output_stream = nullptr;
-	stop_stream_feeder();
-	offline_stop();
 	if (g_janitor.joinable()) {
 		g_janitor_stop = true;
 		g_janitor.join();
 	}
+	SDL_RemoveEventWatch(watch_audio_events, nullptr);
+	if (g_output_stream) SDL_DestroyAudioStream(g_output_stream);
+	g_output_stream = nullptr;
+	stop_stream_feeder();
+	offline_stop();
 	collect_garbage();
 	g_initialized = false;
+	if (SDL_getenv("NVSOUND_REPORT")) {
+		g_timing.report("new core");
+		fprintf(stderr, "nvsound new core: %lld sounds and mixers still exist\n", (long long)g_live_nodes.load());
+	}
 	if (SDL_getenv("NVSOUND_REPORT")) fprintf(stderr, "nvsound audio thread: %zu locks, %zu allocations, %zu retirements lost\n", audio_thread_lock_count(), audio_thread_alloc_count(), g_garbage.lost_count());
 }
+// Posts the event SDL sends when a device is unplugged, so the whole path is tested: the watch, the janitor and the move to the default device.
+void simulate_output_device_loss() {
+	SDL_Event e{};
+	e.type = SDL_EVENT_AUDIO_DEVICE_REMOVED;
+	e.adevice.which = g_output_device_id;
+	e.adevice.recording = false;
+	SDL_PushEvent(&e);
+}
+int64_t live_node_count() { return g_live_nodes; }
 bool is_available() { return init() && (g_output_stream || g_offline); }
 float get_master_volume() { return g_master_volume; }
 void set_master_volume(float v) { g_master_volume = std::clamp(v, -100.0f, 0.0f); }
@@ -678,6 +718,7 @@ unsigned int get_output_device() { return g_output_device; }
 bool set_output_device(unsigned int index) {
 	if (!init()) return false;
 	if (g_offline) return true; // Opening a device would render alongside the script.
+	std::lock_guard<std::mutex> l(g_device_mutex);
 	if (!open_output(index)) {
 		open_output(g_output_device);
 		return false;
@@ -727,6 +768,7 @@ void set_impulse_response_quality(float tail_seconds, int rate_divisor) {
 // The script side. Nothing below runs on the audio thread.
 
 static node* new_node(bool is_mixer) {
+	g_live_nodes++;
 	node* n = new node();
 	n->is_mixer = is_mixer;
 	n->st = std::make_shared<node_status>();
