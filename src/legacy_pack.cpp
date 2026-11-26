@@ -26,7 +26,7 @@
 #endif
 #include "legacy_pack_config.h"
 #include "legacy_pack.h"
-#include "nvsound.h" // open_memory_stream
+#include "nvsound_common.h" // open_memory_stream
 
 using namespace std;
 

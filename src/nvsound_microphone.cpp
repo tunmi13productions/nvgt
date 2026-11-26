@@ -11,7 +11,7 @@
  * 3. This notice may not be removed or altered from any source distribution.
 */
 
-#include "nvsound.h"
+#include "nvsound_api.h"
 #include <algorithm>
 #include <cstring>
 #include <angelscript.h>

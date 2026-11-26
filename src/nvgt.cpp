@@ -51,7 +51,7 @@
 #include "random.h"    // random_seed()
 #include "random_interface.h"    // cleanup_default_random()
 #include "serialize.h" // current location of g_StringTypeid (subject to change)
-#include "nvsound.h"
+#include "nvsound_api.h"
 #include "tts.h"
 #include "UI.h" // message
 #include "version.h"

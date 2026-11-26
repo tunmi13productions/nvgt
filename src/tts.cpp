@@ -24,7 +24,7 @@
 #include <Poco/StringTokenizer.h>
 #include <obfuscate.h>
 #include "nvgt_angelscript.h"
-#include "nvsound.h"
+#include "nvsound_api.h"
 #include "tts.h"
 #include "misc_functions.h"
 #include "UI.h"

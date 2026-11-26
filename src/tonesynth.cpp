@@ -19,7 +19,7 @@
 #include <scriptarray.h>
 #include <Poco/Format.h>
 #include <vector>
-#include "nvsound.h"
+#include "nvsound_api.h"
 #include "nvgt.h" // g_ScriptEngine
 #include "nvgt_angelscript.h" // get_system_namespace
 

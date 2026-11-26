@@ -46,7 +46,7 @@ Commands are applied at the start of a block, before rendering it. A change made
 
 ## What moves to the audio thread
 
-- `play`, `pause`, `stop`, `seek`, `set_loop` and `close` become commands, so a source is only ever read and moved on one thread. That fixes the races.
+- `play`, `pause`, `stop` and `close` change the playing and ended flags by command. Moving a source's read position (`seek`, the restart in `play`, `stop`'s rewind, `set_loop`) stays on the script thread, as today. The sources were built for that: the PCM source with atomics, where the script's seek wins, and streams with locks only the script and feeder sides wait on. Keeping it there matches today exactly and keeps decoder seeks off the audio thread.
 - Volume, pan and pitch, set or slid, become commands. A slide starts on the frame clock when it's applied, which offline is the same frame as today.
 - `set_mixer`, sends, `set_position`, `set_hrtf` and `dry_volume` become commands. The checks that refuse loops (`reaches()`, `is_ancestor_of()`) run on the script side against a mirror of the graph's shape that the script side keeps. The audio thread applies only changes that already passed.
 - `reset_phonon_state()` becomes a command.
@@ -81,6 +81,10 @@ Golden Crayon will later add Steam Audio simulation (ray-traced reflections, tra
 
 `sound_environment` isn't part of the first version. Golden Crayon doesn't use it, and the simulated mode will redesign it around this core.
 
+## The host
+
+Everything the core needs from whoever embeds it is one `host` interface: cache keys and opening files (NVGT's packs and decryption, or plain files), URL streams, BASS era decryption, `wait()`, error logging, and the clock that follows the audio in offline mode. NVGT's is in `nvgt_adapter.cpp`, and Golden Crayon's Python module will have its own.
+
 ## Bindings
 
 - **C++ API:** the `nvsound` namespace, with the classes and functions NVGT registers today, so the NVGT adapter is thin.
@@ -89,10 +93,10 @@ Golden Crayon will later add Steam Audio simulation (ray-traced reflections, tra
 
 ## Order of work
 
-1. The command queue, the garbage ring and the status block, with unit tests that check the audio side never takes a lock (debug builds count lock calls on the audio thread and fail if there are any).
-2. Nodes, mixers, the render path, and parameters and slides, moved from today's code. The engine scenes `dry`, `pan`, `volume`, `pitch`, `slides` and `position` must match.
+1. The command queue, the garbage ring and the status block, with unit tests that check the audio side never takes a lock or allocates. Done.
+2. Nodes, mixers, the render path, and parameters and slides, moved from today's code. The engine scenes `dry`, `pan`, `volume`, `pitch`, `slides` and `position` must match. Done: NVGT builds on the new core with `nvsound_core=1`, and those six renders are byte for byte the same as today's core.
 3. Effects, convolution, HRTF and sends. `lowpass`, `cuts`, `freeverb`, `plate`, `convolution`, `hrtf` and `sends` must match.
 4. Streams and the lock-free ring. `stream` and `crowd` must match.
-5. The NVGT adapter, so all 20 references can run, the map walks included.
+5. The NVGT adapter, so all 20 references can run, the map walks included. Started early, in step 2, since it's how the renders are compared.
 6. The device and microphone, and the failures in the error logs: switching or losing devices, the Default device, an impulse response loading while sound plays, many notes at once, and sounds piling up across map changes.
 7. nanobind.

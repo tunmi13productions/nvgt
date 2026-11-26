@@ -69,7 +69,7 @@
 #include "scriptstuff.h"
 #include "serialize.h"
 #include "opus_codec.h"
-#include "nvsound.h"
+#include "nvsound_api.h"
 #include "system_fingerprint.h"
 #include "threading.h"
 #include "timestuff.h"
