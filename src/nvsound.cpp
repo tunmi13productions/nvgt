@@ -643,6 +643,74 @@ void mixer::render(float* out, int frames, int depth) {
 	apply_gain(acc, out, frames, vol + pos_vol + dry_volume.load(), pn, pos_pan);
 }
 
+// Mirrors the legacy engine's set_fx exactly, including its rules for ids and indexes:
+// An empty string removes the effect at index, or every effect when index is -1.
+// "$id" alone removes every effect whose id starts with it.
+// "$id:name:params" changes the effect with that id in place if there is one (it must be the same type), and otherwise adds a new one.
+// A new effect goes in at index if that is a valid position, otherwise at the end.
+// Returns the index of the effect added or changed, or -1 on failure.
+int sound_base::set_fx(const std::string& fx, int index) {
+	std::vector<std::unique_ptr<effect>> removed; // Destroyed after the lock is let go.
+	if (fx.empty()) {
+		std::lock_guard<std::mutex> l(fx_mutex);
+		if (index >= 0 && index < int(effects.size())) {
+			removed.push_back(std::move(effects[index]));
+			effects.erase(effects.begin() + index);
+		} else if (index == -1) {
+			for (auto& e : effects) removed.push_back(std::move(e));
+			effects.clear();
+		} else return -1;
+		effect_count = int(effects.size());
+		return 1;
+	}
+	std::vector<std::string> args = split_fx_args(fx);
+	if (args.empty()) return -1;
+	if (args.size() == 1 && args[0][0] == '$') {
+		std::lock_guard<std::mutex> l(fx_mutex);
+		for (size_t i = 0; i < effects.size();) {
+			if (effects[i]->id.compare(0, args[0].size(), args[0]) == 0) {
+				removed.push_back(std::move(effects[i]));
+				effects.erase(effects.begin() + i);
+			} else i++;
+		}
+		effect_count = int(effects.size());
+		return 1;
+	}
+	std::string id;
+	if (args[0][0] == '$') {
+		id = args[0].substr(0, 31); // The legacy engine kept ids in 32 byte buffers.
+		args.erase(args.begin());
+		if (args.empty()) return -1;
+	}
+	std::unique_ptr<effect> e = make_effect(args);
+	if (!e) return -1;
+	e->id = id;
+	std::lock_guard<std::mutex> l(fx_mutex);
+	if (id.size() >= 2) {
+		for (size_t i = 0; i < effects.size(); i++) {
+			if (effects[i]->id != id) continue;
+			if (strcmp(effects[i]->type(), e->type()) != 0) return -1;
+			// Reconfigure rather than replace, so a filter or reverb being adjusted every frame keeps its state and doesn't click.
+			if (!effects[i]->configure(args)) return -1;
+			return int(i);
+		}
+	}
+	if (index >= 0 && index < int(effects.size())) {
+		effects.insert(effects.begin() + index, std::move(e));
+	} else {
+		index = int(effects.size());
+		effects.push_back(std::move(e));
+	}
+	effect_count = int(effects.size());
+	return index;
+}
+
+void sound_base::process_fx(float* frames, int count) {
+	if (effect_count == 0) return;
+	std::lock_guard<std::mutex> l(fx_mutex);
+	for (auto& e : effects) e->process(frames, count);
+}
+
 // File and decoded data caches, so a sound loaded many times is read and decoded once. Entries nobody is using expire after a couple of minutes.
 struct cache_entry {
 	std::shared_ptr<const pcm_data> pcm;

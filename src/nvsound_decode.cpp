@@ -11,7 +11,7 @@
 */
 
 #define NOMINMAX // Some of the codec headers pull in windows.h.
-#include "nvsound.h"
+#include "nvsound_common.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>

@@ -11,6 +11,7 @@
 */
 
 #pragma once
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -27,5 +28,10 @@ public:
 	virtual bool configure(const std::vector<std::string>& args) = 0;
 	virtual void process(float* frames, int count) = 0;
 };
+
+// Builds an effect from its name and parameters, or returns null if the name is unknown or too few parameters were given.
+std::unique_ptr<effect> make_effect(const std::vector<std::string>& args);
+// Splits an effect string at its colons, skipping empty fields as the legacy engine's strtok did.
+std::vector<std::string> split_fx_args(const std::string& fx);
 
 } // namespace nvsound
