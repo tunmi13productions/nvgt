@@ -116,11 +116,13 @@ if env["NVGT_TARGET"] == "windows": env.Append(LINKFLAGS = ["/delayload:prism.dl
 
 # nvgt itself
 sources = [str(i)[4:] for i in Glob("src/*.cpp")]
-# nvsound_core=1 builds the new sound core in src/nvsound_core in place of nvsound.cpp. See src/nvsound_core/DESIGN.md. Its HRTF and sound_environment come back in a later step, so nvsound_phonon.cpp is left out for now.
+# nvsound_core=1 builds the new sound core in src/nvsound_core in place of nvsound.cpp. See src/nvsound_core/DESIGN.md. It has HRTF but not sound_environment yet, which nvsound_phonon.cpp leaves out under NVSOUND_CORE.
 if ARGUMENTS.get("nvsound_core", "0") == "1":
-	for s in ("nvsound.cpp", "nvsound_phonon.cpp"): sources.remove(s)
+	sources.remove("nvsound.cpp")
 	sources += ["nvsound_core/" + os.path.basename(str(i)) for i in Glob("src/nvsound_core/*.cpp")]
 	env.Append(CPPDEFINES = ["NVSOUND_CORE"])
+	# nvsound_count_allocs=1 also counts every allocation made on the audio thread. Only for checking.
+	if ARGUMENTS.get("nvsound_count_allocs", "0") == "1": env.Append(CPPDEFINES = ["NVSOUND_COUNT_ALLOCS"])
 if env["NVGT_TARGET"] != "android" and "android.cpp" in sources:
 	sources.remove("android.cpp")
 if env["NVGT_TARGET"] != "windows" and "win.cpp" in sources: sources.remove("win.cpp")

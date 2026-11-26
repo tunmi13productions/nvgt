@@ -26,6 +26,10 @@ namespace nvsound {
 
 struct node;
 struct node_status;
+struct send_entry;
+struct phonon_state;
+class convolver;
+class effect;
 class mixer;
 
 // Shared by sounds and mixers. The node it drives belongs to the audio thread. This object keeps the script's own view: the values it set, and the shape of the mixer tree, so checks like "would this make a loop" never ask the audio thread.
@@ -41,12 +45,33 @@ protected:
 	bool has_resampler = false;
 	bool positioned = false;
 	float dry_asked = 0;
+	// The script side's view of the set_fx chain, the sends, the convolver and HRTF. The audio thread has its own copies of each and never reads these.
+	struct fx_item {
+		std::string id;
+		std::string type;
+		effect* e;
+	};
+	std::vector<fx_item> fx;
+	convolver* ir = nullptr;
+	float ir_dry = 1, ir_wet = 0.35f, ir_spread = 1;
+	phonon_state* phonon = nullptr;
+	bool has_send_input = false; // Mixers only: whether the audio thread has the buffers sends into this mixer need.
+	void ensure_phonon();
+	void send_fx_chain(const std::vector<effect*>& removed);
+	void send_sends(const std::vector<send_entry*>& removed);
+	void destroy_node();
 	explicit sound_base(node* audio_node);
 	void send_resampler();
 	friend class mixer;
 public:
 	mixer* parent = nullptr;
 	std::vector<sound_base*> children; // The script side's view of a mixer's children. Only mixers have any.
+	// The script side's view of this node's sends.
+	struct send_item {
+		mixer* target;
+		send_entry* entry;
+	};
+	std::vector<send_item> sends;
 	bool use_hrtf = false;
 	virtual ~sound_base();
 	void add_ref();
@@ -164,6 +189,7 @@ struct host {
 	// A cache key names a file by where it comes from, so two packs holding the same name never share an entry. Empty for a name that can't be opened.
 	virtual std::string cache_key(const std::string& filename, const pack_interface* pack);
 	virtual std::unique_ptr<std::istream> open(const std::string& cache_key);
+	virtual const pack_interface* default_pack() { return nullptr; } // What impulse responses load through, as sound.load's default argument does.
 	virtual void done(const std::string& cache_key) {} // The key won't be opened again.
 	// A network stream, and what makes a read blocked on it return. Null when URLs aren't supported.
 	virtual std::unique_ptr<std::istream> open_url(const std::string& url, std::function<void()>& abort) { return nullptr; }

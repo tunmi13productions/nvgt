@@ -95,7 +95,7 @@ Everything the core needs from whoever embeds it is one `host` interface: cache 
 
 1. The command queue, the garbage ring and the status block, with unit tests that check the audio side never takes a lock or allocates. Done.
 2. Nodes, mixers, the render path, and parameters and slides, moved from today's code. The engine scenes `dry`, `pan`, `volume`, `pitch`, `slides` and `position` must match. Done: NVGT builds on the new core with `nvsound_core=1`, and those six renders are byte for byte the same as today's core.
-3. Effects, convolution, HRTF and sends. `lowpass`, `cuts`, `freeverb`, `plate`, `convolution`, `hrtf` and `sends` must match.
+3. Effects, convolution, HRTF and sends. `lowpass`, `cuts`, `freeverb`, `plate`, `convolution`, `hrtf` and `sends` must match. Done: all 20 references, the five map walks included, are byte for byte the same as today's core. A checking build (`nvsound_count_allocs=1`, with `NVSOUND_REPORT` set) counted no locks and no allocations on the audio thread across all of them. Its lock count only sees the core's own mutex type. The stream ring's `std::mutex`, which the audio thread still takes to read a stream, is step 4.
 4. Streams and the lock-free ring. `stream` and `crowd` must match.
 5. The NVGT adapter, so all 20 references can run, the map walks included. Started early, in step 2, since it's how the renders are compared.
 6. The device and microphone, and the failures in the error logs: switching or losing devices, the Default device, an impulse response loading while sound plays, many notes at once, and sounds piling up across map changes.

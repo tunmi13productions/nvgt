@@ -11,7 +11,12 @@
  * 3. This notice may not be removed or altered from any source distribution.
 */
 
+#ifdef NVSOUND_CORE
+// The new core has HRTF but not sound_environment yet, which Golden Crayon doesn't use. Everything an environment needs is left out under NVSOUND_CORE.
+#include "nvsound_common.h"
+#else
 #include "nvsound.h"
+#endif
 #include "nvsound_phonon.h"
 #include <algorithm>
 #include <chrono>
@@ -92,6 +97,7 @@ struct phonon_state {
 	env_source* env = nullptr; // Read by the audio thread, so only changed under the graph mutex.
 };
 
+#ifndef NVSOUND_CORE
 class sound_environment {
 	std::atomic<int> ref_count{1};
 	IPLScene scene = nullptr;
@@ -322,6 +328,7 @@ public:
 	sound* new_sound();
 	mixer* new_mixer();
 };
+#endif
 
 phonon_state* create_phonon_state() {
 	if (!phonon_init()) return nullptr;
@@ -336,6 +343,7 @@ phonon_state* create_phonon_state() {
 }
 void release_phonon_state(phonon_state* s) {
 	if (!s) return;
+#ifndef NVSOUND_CORE
 	if (env_source* es = s->env) {
 		{
 			std::lock_guard<std::recursive_mutex> l(get_graph_mutex());
@@ -343,12 +351,14 @@ void release_phonon_state(phonon_state* s) {
 		}
 		es->env->detach(es);
 	}
+#endif
 	if (s->binaural) iplBinauralEffectRelease(&s->binaural);
 	delete s;
 }
 void reset_phonon_state(phonon_state* s) {
 	if (s) s->reset = true;
 }
+#ifndef NVSOUND_CORE
 bool phonon_attach_environment(phonon_state* s, sound_environment* env, float x, float y, float z) {
 	if (!s || !env || s->env) return false;
 	env_source* es = env->attach(x, y, z);
@@ -411,16 +421,19 @@ static void spatialize_in_environment(phonon_state* s, float* frames, const spat
 	}
 	iplAudioBufferInterleave(g_context, &out, frames);
 }
+#endif
 
 // Places stereo audio in direction with the HRTF, in place, and returns the distance attenuation that goes with it in vol_db. Steam Audio takes at most block_frames at a time, so longer requests (from a pitched mixer above) are done in pieces.
 void phonon_spatialize(phonon_state* s, float* frames, int count, const spatial_params& p, float& vol_db) {
 	vol_db = 0;
 	if (s->reset.exchange(false)) iplBinauralEffectReset(s->binaural);
 	// An environment's effects need whole blocks; the odd sized requests a pitched mixer makes fall back to plain HRTF.
+#ifndef NVSOUND_CORE
 	if (s->env && count == block_frames) {
 		spatialize_in_environment(s, frames, p);
 		return;
 	}
+#endif
 	float dx = p.x - p.listener_x, dy = p.y - p.listener_y, dz = p.z - p.listener_z;
 	if (dx == 0 && dy == 0 && dz == 0) {
 		// At the listener, the legacy engine left the audio alone and cleared the effect so it starts clean next time.
@@ -456,6 +469,7 @@ void phonon_spatialize(phonon_state* s, float* frames, int count, const spatial_
 	}
 }
 
+#ifndef NVSOUND_CORE
 // Sounds and mixers made by an environment have HRTF on, which the legacy engine left to the script even though nothing in an environment is heard without it.
 sound* sound_environment::new_sound() {
 	sound* s = make_sound();
@@ -496,5 +510,6 @@ void RegisterNvsoundEnvironment(asIScriptEngine* engine) {
 	engine->RegisterObjectMethod("sound_environment", "void update()", asMETHOD(sound_environment, update), asCALL_THISCALL);
 	engine->RegisterObjectMethod("sound_environment", "void set_listener(float x, float y, float z, float rotation)", asMETHOD(sound_environment, set_listener), asCALL_THISCALL);
 }
+#endif
 
 } // namespace nvsound

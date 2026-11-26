@@ -13,10 +13,14 @@
 
 #include "core.h"
 #include "graph.h"
+#include "../nvsound_convolver.h"
+#include "../nvsound_effects.h"
+#include "../nvsound_phonon.h"
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <thread>
@@ -36,7 +40,7 @@ static unsigned int g_output_device = 1; // 0 is no sound, 1 follows the system 
 static unsigned int g_input_device = 0xffffffff;
 static bool g_initialized = false;
 static bool g_shut_down = false;
-static bool g_global_hrtf = true;
+static std::atomic<bool> g_global_hrtf{true};
 static SDL_AudioStream* g_output_stream = nullptr;
 static const double g_preload_max_seconds = 30.0;
 static command_queue<command> g_commands;
@@ -71,9 +75,21 @@ host& get_host() {
 	return *g_host;
 }
 
+// Runs on a script thread, when the node is collected. Whatever is still attached belongs to the node alone by then.
 node::~node() {
 	delete resampler;
 	delete src;
+	if (fx) {
+		for (effect* e : fx->items) delete e;
+		delete fx;
+	}
+	if (sends) {
+		for (send_entry* e : sends->items) delete e;
+		delete sends;
+	}
+	delete[] send_in;
+	delete ir;
+	release_phonon_state(phonon);
 }
 
 static WDL_Resampler* make_resampler() {
@@ -106,11 +122,14 @@ static float* scratch(int which, int depth, size_t floats) {
 
 // Rendering. Everything from here to apply() is the audio thread's.
 
-// Without HRTF, the legacy engine's positioning: lose a decibel per unit of distance scaled by volume_step, pan by the x offset scaled by pan_step.
-static void spatialize(node* n, float*, int, const spatial_params& p, bool is_positioned, float& vol_db, float& pan_value) {
+// With HRTF, Steam Audio places the sound and only distance changes the volume. Without it, the legacy engine's positioning: lose a decibel per unit of distance scaled by volume_step, pan by the x offset scaled by pan_step.
+static void spatialize(node* n, float* frames, int count, const spatial_params& p, bool is_positioned, float& vol_db, float& pan_value) {
 	vol_db = 0;
 	pan_value = 0;
-	(void)n;
+	if (n->phonon && n->use_hrtf && g_global_hrtf) {
+		phonon_spatialize(n->phonon, frames, count, p, vol_db);
+		return;
+	}
 	if (!is_positioned) return;
 	float dx = p.x - p.listener_x, dy = p.y - p.listener_y, dz = p.z - p.listener_z;
 	if (p.rotation > 0) {
@@ -162,6 +181,71 @@ static void read_params(node* n, uint64_t now, float& vol, float& pn, float& pt)
 	s.pan_sliding.store(n->pan.sliding, std::memory_order_relaxed);
 	s.pitch_sliding.store(n->pitch.sliding, std::memory_order_relaxed);
 }
+static void process_fx(node* n, float* frames, int count) {
+	if (!n->fx) return;
+	for (effect* e : n->fx->items) e->process(frames, count);
+}
+// Spread narrows what feeds the convolver toward mono: at 1 each channel is convolved with its own input, so the wet follows the source's pan; at 0 both get the mono sum, so the wet's stereo comes from the response alone and stays centred.
+static void process_ir(node* n, float* frames, int count, int depth) {
+	if (!n->ir_enabled || !n->ir) return;
+	float spread = n->ir_spread;
+	const float* conv_in = frames;
+	if (spread < 1.0f) {
+		float* narrowed = scratch(1, depth, size_t(count) * 2);
+		for (int f = 0; f < count; f++) {
+			float l = frames[f * 2], r = frames[f * 2 + 1], mono = (l + r) * 0.5f;
+			narrowed[f * 2] = mono + spread * (l - mono);
+			narrowed[f * 2 + 1] = mono + spread * (r - mono);
+		}
+		conv_in = narrowed;
+	}
+	n->ir->process_unlocked(conv_in, frames, frames, unsigned(count), n->ir_dry, n->ir_wet);
+}
+// Adds a sender's audio, ramped between its gains, to this block's buffer, clearing the buffer first if it still holds an older block.
+static void add_send_input(node* m, const float* in, int frames, uint64_t block, float from_left, float from_right, float to_left, float to_right) {
+	if (!m->send_in) return;
+	send_input& b = m->send_in[block & 1];
+	if (b.buf.empty()) return;
+	if (b.block != block) {
+		std::fill(b.buf.begin(), b.buf.end(), 0.0f);
+		b.block = block;
+		b.frames = 0;
+	}
+	// A sender inside a pitched mixer renders more or fewer frames than a block. Its send isn't resampled by that mixer, so only what fits is kept.
+	int count = (std::min)(frames, max_render_frames);
+	float sl = from_left, sr = from_right, dl = (to_left - from_left) / count, dr = (to_right - from_right) / count;
+	for (int f = 0; f < count; f++) {
+		sl += dl;
+		sr += dr;
+		b.buf[f * 2] += in[f * 2] * sl;
+		b.buf[f * 2 + 1] += in[f * 2 + 1] * sr;
+	}
+	b.frames = (std::max)(b.frames, count);
+}
+// Mixes in what was sent here during the previous block.
+static void mix_send_input(node* m, float* acc, int frames, uint64_t block) {
+	if (!m->send_in) return;
+	const send_input& b = m->send_in[(block + 1) & 1];
+	if (b.buf.empty() || b.block + 1 != block || !b.frames) return;
+	int count = (std::min)(frames, b.frames);
+	for (int i = 0; i < count * 2; i++) acc[i] += b.buf[i];
+}
+// Called after spatializing, with the same volume and pans the node's own output gets.
+static void render_sends(node* n, const float* in, int frames, float vol_db, float position_vol_db, float pan_value, float position_pan) {
+	if (!n->sends || n->sends->items.empty()) return;
+	uint64_t block = g_frame_clock / block_frames;
+	for (send_entry* s : n->sends->items) {
+		float gl, gr;
+		stereo_gains(vol_db + (s->after_distance ? position_vol_db : 0) + s->volume.load(), pan_value, position_pan, gl, gr);
+		if (s->last_left < 0) {
+			s->last_left = gl;
+			s->last_right = gr;
+		}
+		add_send_input(s->target, in, frames, block, s->last_left, s->last_right, gl, gr);
+		s->last_left = gl;
+		s->last_right = gr;
+	}
+}
 static void render_node(node* n, float* out, int frames, int depth);
 static void render_mixer(node* n, float* out, int frames, int depth) {
 	if (depth > 64) return; // A cycle can't be built through set_mixer, but never recurse forever.
@@ -184,7 +268,11 @@ static void render_mixer(node* n, float* out, int frames, int depth) {
 		int got = n->resampler->ResampleOut(acc, need, frames, 2);
 		if (got < frames) memset(acc + got * 2, 0, (frames - got) * 2 * sizeof(float));
 	}
+	mix_send_input(n, acc, frames, now / block_frames); // Before the effects, so a reverb on this mixer works on what's sent to it.
+	process_fx(n, acc, frames);
+	process_ir(n, acc, frames, depth);
 	spatialize(n, acc, frames, sp, is_positioned, pos_vol, pos_pan);
+	render_sends(n, acc, frames, vol, pos_vol, pn, pos_pan);
 	apply_gain(n, acc, out, frames, vol + pos_vol + n->dry_volume, pn, pos_pan);
 }
 static void render_sound(node* n, float* out, int frames, int depth) {
@@ -219,7 +307,9 @@ static void render_sound(node* n, float* out, int frames, int depth) {
 		int got = n->resampler->ResampleOut(st, need, frames, 2);
 		if (got < frames) memset(st + got * 2, 0, (frames - got) * 2 * sizeof(float));
 	}
+	process_fx(n, st, frames);
 	spatialize(n, st, frames, sp, is_positioned, pos_vol, pos_pan);
+	render_sends(n, st, frames, vol, pos_vol, pn, pos_pan);
 	apply_gain(n, st, out, frames, vol + pos_vol + n->dry_volume, pn, pos_pan);
 	if (src_ended) {
 		n->playing = false;
@@ -257,6 +347,10 @@ static void publish_slider(const slider& s, std::atomic<bool>& sliding, std::ato
 	end.store(s.end);
 }
 static void apply(const command& c) {
+	if (c.kind == op::retire) {
+		retire(retired{c.ptr, c.destroy});
+		return;
+	}
 	node* n = c.target;
 	node_status& s = *n->st;
 	switch (c.kind) {
@@ -356,6 +450,50 @@ static void apply(const command& c) {
 		case op::set_looping:
 			n->looping = c.flag;
 			break;
+		case op::set_fx_chain:
+			// The old container goes, not the effects in it: the ones the script removed come separately, as op::retire after this.
+			if (n->fx) retire(retire_as(n->fx));
+			n->fx = static_cast<effect_chain*>(c.ptr);
+			break;
+		case op::configure_fx: {
+			// Reconfigured in place, so a filter or reverb being adjusted every frame keeps its state and doesn't click. Only effects whose configure doesn't allocate come this way.
+			auto* args = static_cast<std::vector<std::string>*>(c.ptr2);
+			static_cast<effect*>(c.ptr)->configure(*args);
+			retire(retire_as(args));
+			break;
+		}
+		case op::set_sends:
+			if (n->sends) retire(retire_as(n->sends));
+			n->sends = static_cast<send_list*>(c.ptr);
+			break;
+		case op::set_send_input:
+			if (!n->send_in) n->send_in = static_cast<send_input*>(c.ptr);
+			break;
+		case op::attach_convolver:
+			if (!n->ir) n->ir = static_cast<convolver*>(c.ptr);
+			break;
+		case op::set_ir_state:
+			if (n->ir) {
+				convolver::state* old = n->ir->swap_state(static_cast<convolver::state*>(c.ptr));
+				if (old) retire(retired{old, [](void* p) { convolver::destroy_state(static_cast<convolver::state*>(p)); }});
+			}
+			break;
+		case op::set_ir_enabled:
+			n->ir_enabled = c.flag;
+			break;
+		case op::set_ir_params:
+			n->ir_dry = c.value;
+			n->ir_wet = c.value2;
+			n->ir_spread = c.value3;
+			break;
+		case op::attach_phonon:
+			if (!n->phonon) n->phonon = static_cast<phonon_state*>(c.ptr);
+			break;
+		case op::set_hrtf:
+			n->use_hrtf = c.flag;
+			break;
+		case op::retire:
+			break; // Handled above, since it has no node.
 	}
 }
 
@@ -529,6 +667,7 @@ void shutdown() {
 	}
 	collect_garbage();
 	g_initialized = false;
+	if (SDL_getenv("NVSOUND_REPORT")) fprintf(stderr, "nvsound audio thread: %zu locks, %zu allocations, %zu retirements lost\n", audio_thread_lock_count(), audio_thread_alloc_count(), g_garbage.lost_count());
 }
 bool is_available() { return init() && (g_output_stream || g_offline); }
 float get_master_volume() { return g_master_volume; }
@@ -571,8 +710,17 @@ std::vector<std::string> get_input_device_names() {
 	return names;
 }
 bool get_global_hrtf() { return g_global_hrtf; }
-void set_global_hrtf(bool enable) { g_global_hrtf = enable; }
-void set_impulse_response_quality(float, int) {} // Item 3.
+void set_global_hrtf(bool enable) {
+	g_global_hrtf = enable;
+	if (enable) phonon_init();
+}
+// set_impulse_response. Responses loaded from now on are cut to tail_seconds (0 keeps them whole) and convolved at the sample rate divided by rate_divisor, trading quality for work. 1.5 seconds and full rate are the defaults hide and seek's engine used.
+static std::atomic<float> g_ir_tail_seconds{1.5f};
+static std::atomic<int> g_ir_rate_divisor{1};
+void set_impulse_response_quality(float tail_seconds, int rate_divisor) {
+	g_ir_tail_seconds = (std::max)(tail_seconds, 0.0f);
+	g_ir_rate_divisor = (std::max)(rate_divisor, 1);
+}
 
 // The script side. Nothing below runs on the audio thread.
 
@@ -677,15 +825,272 @@ bool sound_base::set_position(float lx, float ly, float lz, float sx, float sy, 
 	c.sp = spatial_params{lx, ly, lz, sx, sy, sz, rot, pstep, vstep};
 	positioned = c.flag = lx != sx || ly != sy || lz != sz;
 	send(c);
+	ensure_phonon();
 	return true;
 }
-void sound_base::set_hrtf(bool enable) { use_hrtf = enable; } // Item 3.
-int sound_base::set_fx(const std::string&, int) { return -1; } // Item 3.
-bool sound_base::set_impulse_response(const std::string&, float, float, const std::string&, float) { return false; } // Item 3.
-bool sound_base::set_impulse_response_params(float, float, float) { return false; } // Item 3.
-bool sound_base::set_send(mixer*, float, bool) { return false; } // Item 3.
-bool sound_base::remove_send(mixer*) { return false; } // Item 3.
-float sound_base::get_send(mixer*) { return -100; } // Item 3.
+// Builds this node's Steam Audio effects the first time a positioned sound needs HRTF. Done here, since the audio thread doesn't allocate.
+void sound_base::ensure_phonon() {
+	if (phonon || !positioned || !use_hrtf || !g_global_hrtf) return;
+	phonon = create_phonon_state();
+	if (!phonon) return;
+	command c{op::attach_phonon};
+	c.target = n;
+	c.ptr = phonon;
+	send(c);
+}
+void sound_base::set_hrtf(bool enable) {
+	use_hrtf = enable;
+	command c{op::set_hrtf};
+	c.target = n;
+	c.flag = enable;
+	send(c);
+	ensure_phonon();
+}
+static void retire_later(void* object, void (*destroy)(void*)) {
+	command c{op::retire};
+	c.target = nullptr;
+	c.ptr = object;
+	c.destroy = destroy;
+	send(c);
+}
+// Sends the chain as the script side now has it, then the effects that left it, which the audio thread retires once the new chain is in.
+void sound_base::send_fx_chain(const std::vector<effect*>& removed) {
+	auto* chain = new effect_chain();
+	for (auto& f : fx) chain->items.push_back(f.e);
+	command c{op::set_fx_chain};
+	c.target = n;
+	c.ptr = chain;
+	send(c);
+	for (effect* e : removed) retire_later(e, [](void* p) { delete static_cast<effect*>(p); });
+}
+// Effects whose configure reallocates their delay lines when their size changes. These are swapped for a configured copy instead of reconfigured in place, so the audio thread never allocates. Their state starts over when that happens.
+static bool configure_allocates(const std::string& type) { return type == "reverb" || type == "i3dl2reverb" || type == "echo4" || type == "chorus"; }
+// The legacy engine's set_fx rules, as today's core has them:
+// An empty string removes the effect at index, or every effect when index is -1.
+// "$id" alone removes every effect whose id starts with it.
+// "$id:name:params" changes the effect with that id in place if there is one (it must be the same type), and otherwise adds a new one.
+// A new effect goes in at index if that is a valid position, otherwise at the end.
+// Returns the index of the effect added or changed, or -1 on failure.
+int sound_base::set_fx(const std::string& text, int index) {
+	std::vector<effect*> removed;
+	if (text.empty()) {
+		if (index >= 0 && index < int(fx.size())) {
+			removed.push_back(fx[index].e);
+			fx.erase(fx.begin() + index);
+		} else if (index == -1) {
+			for (auto& f : fx) removed.push_back(f.e);
+			fx.clear();
+		} else return -1;
+		send_fx_chain(removed);
+		return 1;
+	}
+	std::vector<std::string> args = split_fx_args(text);
+	if (args.empty()) return -1;
+	if (args.size() == 1 && args[0][0] == '$') {
+		for (size_t i = 0; i < fx.size();) {
+			if (fx[i].id.compare(0, args[0].size(), args[0]) == 0) {
+				removed.push_back(fx[i].e);
+				fx.erase(fx.begin() + i);
+			} else i++;
+		}
+		send_fx_chain(removed);
+		return 1;
+	}
+	std::string id;
+	if (args[0][0] == '$') {
+		id = args[0].substr(0, 31); // The legacy engine kept ids in 32 byte buffers.
+		args.erase(args.begin());
+		if (args.empty()) return -1;
+	}
+	std::unique_ptr<effect> e = make_effect(args);
+	if (!e) return -1;
+	e->id = id;
+	if (id.size() >= 2) {
+		for (size_t i = 0; i < fx.size(); i++) {
+			if (fx[i].id != id) continue;
+			if (fx[i].type != e->type()) return -1;
+			// The fresh copy above has already shown these arguments configure.
+			if (configure_allocates(fx[i].type)) {
+				removed.push_back(fx[i].e);
+				fx[i].e = e.release();
+				send_fx_chain(removed);
+			} else {
+				command c{op::configure_fx};
+				c.target = n;
+				c.ptr = fx[i].e;
+				c.ptr2 = new std::vector<std::string>(args);
+				send(c);
+			}
+			return int(i);
+		}
+	}
+	fx_item item{id, e->type(), e.release()};
+	if (index >= 0 && index < int(fx.size())) fx.insert(fx.begin() + index, item);
+	else {
+		index = int(fx.size());
+		fx.push_back(item);
+	}
+	send_fx_chain(removed);
+	return index;
+}
+
+// Decodes a whole file, through the default pack like sound.load, at the engine's sample rate.
+static std::shared_ptr<const pcm_data> decode_all(decoder& dec);
+static std::unique_ptr<std::istream> open_file(const std::string& key);
+static std::shared_ptr<const pcm_data> decode_file(const std::string& filename) {
+	std::string key = get_host().cache_key(filename, get_host().default_pack());
+	if (key.empty()) return nullptr;
+	std::unique_ptr<std::istream> in = open_file(key);
+	std::unique_ptr<decoder> dec = in ? open_decoder(std::move(in)) : nullptr;
+	return dec ? decode_all(*dec) : nullptr;
+}
+bool sound_base::set_impulse_response(const std::string& response, float dry, float wet, const std::string& response_right, float spread) {
+	if (!init()) return false;
+	if (response.empty()) {
+		command off{op::set_ir_enabled};
+		off.target = n;
+		send(off);
+		if (ir) {
+			command clear{op::set_ir_state};
+			clear.target = n;
+			send(clear);
+		}
+		return true;
+	}
+	std::shared_ptr<const pcm_data> left = decode_file(response);
+	if (!left || left->frames == 0) return false;
+	std::vector<float> stereo;
+	const float* frames = left->samples.data();
+	uint64_t count = left->frames;
+	unsigned int channels = left->channels;
+	if (!response_right.empty()) {
+		// Two responses make one true stereo response: the first file's first channel on the left, the second's on the right.
+		std::shared_ptr<const pcm_data> right = decode_file(response_right);
+		if (!right || right->frames == 0) return false;
+		count = (std::max)(left->frames, right->frames);
+		stereo.assign(size_t(count) * 2, 0.0f);
+		for (uint64_t f = 0; f < left->frames; f++) stereo[f * 2] = left->samples[f * left->channels];
+		for (uint64_t f = 0; f < right->frames; f++) stereo[f * 2 + 1] = right->samples[f * right->channels];
+		frames = stereo.data();
+		channels = 2;
+	}
+	if (!ir) {
+		ir = new convolver(2, g_sample_rate);
+		command c{op::attach_convolver};
+		c.target = n;
+		c.ptr = ir;
+		send(c);
+	}
+	// Built here, however long it takes. The audio thread only swaps it in.
+	convolver::state* state = ir->build_state(frames, count, channels, g_ir_tail_seconds, unsigned(g_ir_rate_divisor));
+	if (!state) return false;
+	command c{op::set_ir_state};
+	c.target = n;
+	c.ptr = state;
+	send(c);
+	set_impulse_response_params(dry, wet, spread);
+	command on{op::set_ir_enabled};
+	on.target = n;
+	on.flag = true;
+	send(on);
+	return true;
+}
+// Cheap enough to call every frame, as a game easing the reverb with distance does: nothing is reloaded.
+bool sound_base::set_impulse_response_params(float dry, float wet, float spread) {
+	ir_dry = (std::max)(dry, 0.0f);
+	ir_wet = (std::max)(wet, 0.0f);
+	ir_spread = std::clamp(spread, 0.0f, 1.0f);
+	command c{op::set_ir_params};
+	c.target = n;
+	c.value = ir_dry;
+	c.value2 = ir_wet;
+	c.value3 = ir_spread;
+	send(c);
+	return true;
+}
+
+// Sends
+// Whether audio leaving from reaches m's input, up the mixer tree or through sends. Uses the script side's view of both.
+static bool reaches(sound_base* from, mixer* m, int depth) {
+	if (depth > 64) return true; // Deeper than any real graph; refusing is the safe answer.
+	for (sound_base* p = from; p; p = p->parent) {
+		if (p == m) return true;
+		for (auto& s : p->sends) {
+			if (reaches(s.target, m, depth + 1)) return true;
+		}
+	}
+	return false;
+}
+void sound_base::send_sends(const std::vector<send_entry*>& removed) {
+	auto* list = new send_list();
+	for (auto& s : sends) list->items.push_back(s.entry);
+	command c{op::set_sends};
+	c.target = n;
+	c.ptr = list;
+	send(c);
+	for (send_entry* e : removed) retire_later(e, [](void* p) { delete static_cast<send_entry*>(p); });
+}
+// Adds a send to target, or changes the volume of the one already there.
+bool sound_base::set_send(mixer* target, float volume, bool after_distance) {
+	if (!target || target == this) return false;
+	volume = std::clamp(volume, -100.0f, 0.0f);
+	for (auto& s : sends) {
+		if (s.target != target) continue;
+		s.entry->volume = volume;
+		s.entry->after_distance = after_distance;
+		return true;
+	}
+	// Refuse anything that would feed back into this node, which with a send's delay would ring or run away rather than recurse.
+	if (reaches(target, dynamic_cast<mixer*>(this), 0)) return false;
+	if (!target->has_send_input) {
+		auto* in = new send_input[2];
+		for (int b = 0; b < 2; b++) in[b].buf.assign(size_t(max_render_frames) * 2, 0.0f);
+		command c{op::set_send_input};
+		c.target = target->n;
+		c.ptr = in;
+		send(c);
+		target->has_send_input = true;
+	}
+	auto* entry = new send_entry();
+	entry->target = target->n;
+	entry->volume = volume;
+	entry->after_distance = after_distance;
+	target->add_ref();
+	sends.push_back(send_item{target, entry});
+	send_sends({});
+	return true;
+}
+// Removes the send to target, or every send when target is null.
+bool sound_base::remove_send(mixer* target) {
+	std::vector<send_entry*> removed;
+	std::vector<mixer*> targets;
+	auto keep = std::stable_partition(sends.begin(), sends.end(), [target](const send_item& s) { return target && s.target != target; });
+	for (auto it = keep; it != sends.end(); ++it) {
+		removed.push_back(it->entry);
+		targets.push_back(it->target);
+	}
+	sends.erase(keep, sends.end());
+	if (removed.empty()) return false;
+	send_sends(removed);
+	for (mixer* m : targets) m->release(); // After the commands, so the audio thread is done with the mixer before it can be destroyed.
+	return true;
+}
+float sound_base::get_send(mixer* target) {
+	for (auto& s : sends) {
+		if (s.target == target) return s.entry->volume;
+	}
+	return -100;
+}
+// Tells the audio thread this node is gone, after letting go of its sends.
+void sound_base::destroy_node() {
+	std::vector<mixer*> targets;
+	for (auto& s : sends) targets.push_back(s.target);
+	sends.clear(); // The node still holds its list, and deletes the entries in it when it's collected.
+	command c{op::destroy};
+	c.target = n;
+	send(c);
+	for (mixer* m : targets) m->release();
+}
 float sound_base::get_dry_volume() { return dry_asked; }
 void sound_base::set_dry_volume(float v) {
 	dry_asked = std::clamp(v, -100.0f, 0.0f);
@@ -718,9 +1123,7 @@ mixer::~mixer() {
 		c.erase(std::remove(c.begin(), c.end(), this), c.end());
 		parent = nullptr;
 	}
-	command c{op::destroy};
-	c.target = n;
-	send(c);
+	destroy_node();
 }
 bool mixer::is_ancestor_of(mixer* m) {
 	for (; m; m = m->parent) {
@@ -731,6 +1134,12 @@ bool mixer::is_ancestor_of(mixer* m) {
 bool mixer::set_mixer(mixer* m) {
 	if (!m) m = g_master;
 	if (this == g_master || is_ancestor_of(m)) return false;
+	// Moving under m must not close a loop through sends either: nothing this mixer's output reaches may send back into it from below.
+	for (sound_base* from = m; from; from = from->parent) {
+		for (auto& s : from->sends) {
+			if (reaches(s.target, this, 0)) return false;
+		}
+	}
 	return set_parent(m);
 }
 
@@ -807,9 +1216,7 @@ sound::~sound() {
 		c.erase(std::remove(c.begin(), c.end(), this), c.end());
 		parent = nullptr;
 	}
-	command c{op::destroy};
-	c.target = n;
-	send(c);
+	destroy_node();
 	// The audio thread's reference to the source goes with the node, when it's collected. This one goes now.
 }
 bool sound::set_mixer(mixer* m) { return set_parent(m ? m : g_master); }
@@ -1063,6 +1470,7 @@ bool sound::pause() {
 	playing_asked = false;
 	ended_asked = ended_now();
 	send_transport(n, op::pause, ++transport_seq);
+	reset_phonon_state(phonon);
 	return true;
 }
 bool sound::stop() {
@@ -1071,6 +1479,7 @@ bool sound::stop() {
 	ended_asked = false;
 	send_transport(n, op::stop, ++transport_seq);
 	src->seek(0);
+	reset_phonon_state(phonon);
 	return true;
 }
 bool sound::seek(float ms) {
@@ -1082,6 +1491,7 @@ bool sound::seek(float ms) {
 		playing_asked = playing_now();
 		send_transport(n, playing_asked ? op::play : op::stop, ++transport_seq);
 	}
+	reset_phonon_state(phonon);
 	return true;
 }
 bool sound::is_active() { return src && parent; }

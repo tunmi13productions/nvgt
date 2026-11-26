@@ -12,6 +12,7 @@
 */
 
 #include "core.h"
+#include "realtime.h"
 #include <cfloat>
 #include <angelscript.h>
 #include <reactphysics3d/mathematics/Vector3.h>
@@ -26,6 +27,19 @@
 #include "../sound_service.h"
 #include "../timestuff.h" // microticks, set_virtual_clock
 #include "../UI.h" // wait
+
+#ifdef NVSOUND_COUNT_ALLOCS
+// A checking build (nvsound_count_allocs=1): every allocation goes through here, so one made while rendering is counted. Set NVSOUND_REPORT to print the counts at exit.
+#include <cstdlib>
+#include <new>
+void* operator new(size_t n) {
+	if (nvsound::on_audio_thread()) nvsound::note_audio_thread_alloc();
+	if (void* p = std::malloc(n ? n : 1)) return p;
+	throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+#endif
 
 namespace nvsound {
 
@@ -61,6 +75,7 @@ struct nvgt_host : host {
 	}
 	std::unique_ptr<std::istream> open(const std::string& key) override { return std::unique_ptr<std::istream>(g_service->open_triplet(key.c_str())); }
 	void done(const std::string& key) override { g_service->cleanup_triplet(key); }
+	const pack_interface* default_pack() override { return g_default_pack.get(); }
 	std::unique_ptr<std::istream> open_url(const std::string& url, std::function<void()>& abort) override {
 		std::istream* source = nullptr;
 		try {

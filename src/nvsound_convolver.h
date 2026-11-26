@@ -19,7 +19,9 @@ namespace nvsound {
 
 // Convolves interleaved audio with a recorded impulse response. The algorithm is the one in dep/ma_convolution_node.c, moved out of its MiniAudio node.
 class convolver {
+public:
 	struct state;
+private:
 	std::unique_ptr<state> st;
 	std::mutex m; // The audio thread only ever waits on this for a pointer swap.
 	unsigned int channels, sample_rate, partition_size;
@@ -32,6 +34,11 @@ public:
 	bool has_ir();
 	// out = dry_in * dry + (conv_in convolved) * wet. conv_in and dry_in can be different, so the wet path can be fed a narrowed stereo image. out may be the same as either input.
 	void process(const float* conv_in, const float* dry_in, float* out, unsigned int frames, float dry, float wet);
+	// For a core whose audio thread owns the convolver and takes no lock: build a response's state anywhere, hand it over, and swap it in on the audio thread, which returns the old one to free elsewhere. process_unlocked is process without the lock.
+	state* build_state(const float* frames, uint64_t frame_count, unsigned int ir_channels, float tail_seconds = 0, unsigned int rate_divisor = 1);
+	state* swap_state(state* s);
+	static void destroy_state(state* s);
+	void process_unlocked(const float* conv_in, const float* dry_in, float* out, unsigned int frames, float dry, float wet);
 };
 
 } // namespace nvsound

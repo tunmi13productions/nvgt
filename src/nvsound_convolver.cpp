@@ -177,11 +177,11 @@ struct convolver::state {
 convolver::convolver(unsigned int channels, unsigned int sample_rate, unsigned int partition_size) : channels(channels), sample_rate(sample_rate), partition_size(partition_size) {}
 convolver::~convolver() {}
 
-bool convolver::set_ir(const float* frames, uint64_t frame_count, unsigned int ir_channels, float tail_seconds, unsigned int rate_divisor) {
-	if (!frames || frame_count == 0 || ir_channels == 0) return false;
+convolver::state* convolver::build_state(const float* frames, uint64_t frame_count, unsigned int ir_channels, float tail_seconds, unsigned int rate_divisor) {
+	if (!frames || frame_count == 0 || ir_channels == 0) return nullptr;
 	double fs = sample_rate;
 	unsigned int div = rate_divisor < 1 ? 1 : rate_divisor;
-	if ((div & (div - 1)) != 0 || partition_size / div < 8) return false;
+	if ((div & (div - 1)) != 0 || partition_size / div < 8) return nullptr;
 	unsigned int B = partition_size / div, N = B * 2;
 	double fc = 0.8 * fs / (2.0 * div);
 	uint64_t L = frame_count, fade = 0;
@@ -195,10 +195,10 @@ bool convolver::set_ir(const float* frames, uint64_t frame_count, unsigned int i
 		}
 	}
 	uint64_t Ld = (L + div - 1) / div;
-	if ((Ld + B - 1) / B > 0xFFFFFFu) return false;
+	if ((Ld + B - 1) / B > 0xFFFFFFu) return nullptr;
 	unsigned int P = std::max<unsigned int>(unsigned((Ld + B - 1) / B), 1);
 	uint64_t history = uint64_t(P) * N * channels;
-	if (history * sizeof(float) * 4 > conv_max_bytes) return false;
+	if (history * sizeof(float) * 4 > conv_max_bytes) return nullptr;
 	auto s = std::make_unique<state>();
 	s->channels = channels;
 	s->div = div;
@@ -269,6 +269,11 @@ bool convolver::set_ir(const float* frames, uint64_t frame_count, unsigned int i
 			s->ai[c].set(fs, fc);
 		}
 	}
+	return s.release();
+}
+bool convolver::set_ir(const float* frames, uint64_t frame_count, unsigned int ir_channels, float tail_seconds, unsigned int rate_divisor) {
+	std::unique_ptr<state> s(build_state(frames, frame_count, ir_channels, tail_seconds, rate_divisor));
+	if (!s) return false;
 	// The expensive part is done. The audio thread only waits for the swap, and the old state is freed after the lock is let go.
 	std::unique_ptr<state> old;
 	{
@@ -278,6 +283,12 @@ bool convolver::set_ir(const float* frames, uint64_t frame_count, unsigned int i
 	}
 	return true;
 }
+convolver::state* convolver::swap_state(state* s) {
+	state* old = st.release();
+	st.reset(s);
+	return old;
+}
+void convolver::destroy_state(state* s) { delete s; }
 void convolver::clear_ir() {
 	std::unique_ptr<state> old;
 	std::lock_guard<std::mutex> l(m);
@@ -290,6 +301,9 @@ bool convolver::has_ir() {
 
 void convolver::process(const float* conv_in, const float* dry_in, float* out, unsigned int frames, float dry, float wet) {
 	std::lock_guard<std::mutex> l(m);
+	process_unlocked(conv_in, dry_in, out, frames, dry, wet);
+}
+void convolver::process_unlocked(const float* conv_in, const float* dry_in, float* out, unsigned int frames, float dry, float wet) {
 	uint64_t total = uint64_t(frames) * channels;
 	if (!st) {
 		for (uint64_t i = 0; i < total; i++) out[i] = dry_in[i] * dry;
