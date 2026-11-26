@@ -876,7 +876,12 @@ bool sound_base::set_position(float lx, float ly, float lz, float sx, float sy, 
 void sound_base::ensure_phonon() {
 	if (phonon || !positioned || !use_hrtf || !g_global_hrtf) return;
 	phonon = create_phonon_state();
-	if (!phonon) return;
+	if (!phonon) {
+		// Otherwise HRTF just quietly becomes plain panning, which is easy to miss.
+		static std::atomic<bool> said{false};
+		if (!said.exchange(true)) get_host().log_error("Steam Audio couldn't be loaded, so HRTF is off and sounds are panned instead");
+		return;
+	}
 	command c{op::attach_phonon};
 	c.target = n;
 	c.ptr = phonon;
